@@ -14,7 +14,7 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 
 def get_weather(location: str) -> str:
-    """Get the current weather for a location."""
+    """Tool: the weather right now (temperature, humidity, wind) for a city, a neighborhood or a ZIP code."""
     try:
         places = requests.get(GEOCODE_URL, params={"name": location, "count": 1}, timeout=10).json()
         if not places.get("results"):
@@ -51,17 +51,27 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_weather",
-            "description": "Get the current weather (temperature, humidity, wind) for a city.",
+            "description": (
+                "Get the weather right now in one place: the temperature in degrees Fahrenheit, the relative "
+                "humidity in percent and the wind speed in miles per hour. Use it when the answer depends on the "
+                "outdoor conditions at this moment, such as whether to walk or what to wear today. For a later "
+                "date use get_forecast; a building's heat or hot water is a housing question for check_building. "
+                "Returns the name of the place that was matched with the three readings, or an error saying the "
+                "place was not found."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "location": {"type": "string", "description": "City name, e.g. 'New York'"},
+                    "location": {
+                        "type": "string",
+                        "description": "A city or neighborhood name, or a US ZIP code, e.g. 'New York', 'Astoria' or '10027'.",
+                    },
                 },
                 "required": ["location"],
             },
         },
     },
-    *APARTMENT_TOOLS,  # check_building, check_landlord, check_neighborhood (apartment.py)
+    *APARTMENT_TOOLS,  # check_building, check_landlord, check_neighborhood, compare_neighborhoods (apartment.py)
     *EVENTS_TOOLS,  # find_free_events, find_freebies, get_forecast, curb_hunt_score, estimate_wait_time, build_itinerary, freebie_checklist (events.py)
     SHOPPING_TOOL, #  search_products_that_fit (shopping.py)
 ]

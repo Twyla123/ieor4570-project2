@@ -1,7 +1,7 @@
 [project]
-name = "gemini-web-tool-calling"
+name = "new-in-nyc"
 version = "0.1.0"
-description = "qwen-tool-calling behind a web server: FastAPI + LiteLLM + Gemini, with tool calls shown in the UI"
+description = "New in NYC: a research agent for people settling into New York, built on city housing records, free events and furnishing costs (FastAPI + LiteLLM + Gemini)"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.109.0",
