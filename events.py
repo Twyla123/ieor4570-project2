@@ -71,6 +71,34 @@ def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+PARKS_HEADERS = {"User-Agent": "StoopNYC-class-project/1.0 (Columbia University course project)"}
+PARKS_CACHE_SECONDS = 10 * 60  # the feed is about 700 KB and changes slowly
+_parks_cache: dict = {"fetched_at": 0.0, "events": []}
+
+
+def _load_parks() -> list[dict]:
+    """The NYC Parks events feed: cached, retried once, and the last good copy is used if a refresh fails.
+
+    Raises requests.RequestException when the feed cannot be read and nothing is cached.
+    """
+    if _parks_cache["events"] and time.time() - _parks_cache["fetched_at"] < PARKS_CACHE_SECONDS:
+        return _parks_cache["events"]
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            response = requests.get(PARKS_EVENTS_URL, headers=PARKS_HEADERS, timeout=25)
+            response.raise_for_status()
+            events = response.json()
+            _parks_cache.update(fetched_at=time.time(), events=events)
+            return events
+        except (requests.RequestException, ValueError) as e:
+            last_error = e
+            time.sleep(1)
+    if _parks_cache["events"]:
+        return _parks_cache["events"]
+    raise requests.RequestException(f"{type(last_error).__name__}: {last_error}")
+
+
 def _forecast(target: date) -> dict:
     """Daily forecast for NYC on one date. Raises requests.RequestException on failure."""
     data = requests.get(
@@ -117,7 +145,7 @@ def find_free_events(
         return _err("Dates must look like YYYY-MM-DD, e.g. 2026-10-03.")
 
     try:
-        events = requests.get(PARKS_EVENTS_URL, timeout=15).json()
+        events = _load_parks()
     except (requests.RequestException, ValueError) as e:
         return _err(f"NYC Parks events feed failed: {e}. Tell the user and offer to try again.")
 
@@ -693,7 +721,7 @@ def events_near_neighborhoods(
 
     listed, problems, without_location = [], [], 0
     try:
-        for ev in requests.get(PARKS_EVENTS_URL, timeout=15).json():
+        for ev in _load_parks():
             try:
                 ev_date = datetime.strptime(ev["startdate"], "%Y-%m-%d").date()
             except (KeyError, ValueError):
