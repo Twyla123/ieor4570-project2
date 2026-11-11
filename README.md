@@ -1,104 +1,124 @@
-# New in NYC
+# New in NYC: a research agent for settling into New York
 
-AI helpers for students who just landed in New York. Pick a helper, ask one focused question, and see which records it checked.
+Ask one question about settling into New York City and a small team of agents researches it in parallel and writes you a cited report. It compares neighborhoods and buildings using the city's housing records, finds free events and giveaways nearby, and checks what furnishing a room costs.
 
-**Live app:** https://ieor4570-project1-git-770026520963.us-east1.run.app
-(Sign in with a Columbia Google account if prompted.)
+**Live app:** DEPLOY_URL_GOES_HERE (sign in with a Columbia Google account if prompted)
 
-A three-student IEOR 4570 project (Project 1: A Tool-Calling Agent). Authors: usm2104, xz2843, sz3410.
+A three-student IEOR 4570 project (Project 2: A Data Exploration Agent, path: Deep Research). Authors: usm2104, xz2843, sz3410.
 
-## Why we built this
+## Who it is for
 
-We are three students who came to New York and are slowly becoming New Yorkers, and each helper comes from something one of us actually cares about:
+Anyone choosing where to live or settling in: a student who just arrived, a last-semester student deciding where to stay after graduating, or anyone moving to a new neighborhood. It answers questions like "which of these neighborhoods has better-kept buildings and more free things to do?" and "how is this building?". It shows the evidence and what it cannot tell you. It does not tell you which place to pick.
 
-- **A good apartment.** One of us wants a place that is good quality: no heat problems, no pests, a landlord who takes care of the building. The city publishes all of that, but it is scattered across datasets nobody reads before signing a lease.
-- **Hunting for freebies.** One of us loves finding free things in her spare time, from free events and pop-up giveaways to furniture left on the curb. A friend took her hunting for free items one weekend, it was a blast, and she wanted a way to plan it.
-- **Discounts and free stuff.** One of us loves a good deal, and wants furniture that fits both the budget and the room, because a bargain that does not fit through the door is not one.
+## How it works (Deep Research)
 
-So New in NYC is built from our own first-month experience: finding a place, getting stuff for it, and having fun without spending much.
+```
+You (one chat box)
+  -> Lead         asks you one question if the request is too vague, otherwise plans the research
+      -> Housing researcher   NYC housing records            \
+      -> Events researcher    free events and giveaways       } run in parallel, each in a fresh context
+      -> Shopping researcher  Amazon furniture and its size  /
+      <- findings; if a gap is left the Lead sends researchers out again (up to 3 rounds)
+  -> Writer       one report, every fact linked to its source, plus what the data cannot tell you
+```
 
-## The idea
+- `agents.py`: the Lead, the researcher loop, the Writer, and the parallel fan-out (a thread per researcher). The turn caps are `MAX_LEAD_ROUNDS = 3` and `MAX_RESEARCHER_ROUNDS = 5`, and no new work starts after 240 seconds, because graders wait up to 5 minutes.
+- Each researcher is a dict (`name`, `description`, `instructions`, `tools`, `tool_map`): `HOUSING_RESEARCHER` in `apartment.py`, `EVENTS_RESEARCHER` in `events.py`, `SHOPPING_RESEARCHER` in `shopping.py`. The Lead reads each `description` to decide who gets a task.
+- `app.py`: the FastAPI server. `POST /chat` takes `{message, session_id}` and returns `{response, session_id, tool_calls}`. Every entry in `tool_calls` is `{agent, name, args, result}`: the Lead's own calls (`research`, `ask_user`) have `agent: "lead"`, and each researcher's tool calls carry its name (`housing`, `events`, `shopping`).
+- `index.html`: the front end.
 
-Moving to a new city means opening twenty tabs: find a place, fill it, find something to do. New in NYC puts that first month behind one chat page with a helper for each part. Each helper is a Gemini agent that decides which tools to call, reads real data, and answers only with what the tools returned. The page shows every tool call (name, arguments, result) above the answer.
+## Data
 
-| Helper | Owner | What it does | Status |
+All of it is read live by tools, not stored in the repo, so nothing needs to be loaded to run the app. The model does not know it: the events change daily and the housing records are updated by the city continuously.
+
+| Source | Used for | How it is read |
+|---|---|---|
+| NYC Open Data: Housing Maintenance Code Violations (`wvxf-dwi5`), Complaints and Problems (`ygpa-z7cr`), Rodent Inspection (`p937-wjvj`), Bedbug Reporting (`wz6d-d3jb`), Multiple Dwelling Registrations (`tesw-yqqr`), Registration Contacts (`feu5-w2e2`), PLUTO tax lots (`64uk-42ks`), 311 Service Requests (`erm2-nwe9`) | Building and neighborhood condition, owner, noise | Socrata API, `https://data.cityofnewyork.us/resource/<id>.json`, no key |
+| NYS Open Data: MTA Subway Stations (`39hk-dx4f`) | Nearby subway | `https://data.ny.gov/resource/39hk-dx4f.json` |
+| NYC Parks Events feed | Free Parks events | `https://www.nycgovparks.org/xml/events_300_rss.json` |
+| [NYC for FREE](https://www.nycforfree.co/events) | Pop-ups, giveaways, free food | Their public events page, read lightly and cached for 30 minutes, credited and linked back |
+| Open-Meteo | Forecasts for day plans | Public API, no key |
+| Amazon search through SerpApi | Furniture prices and listed sizes | Needs `SERPAPI_API_KEY` |
+
+Wait times, itineraries and the curbside-find score are our own estimates, not data, and the agent labels them that way. We did not use What is this line for? because its terms ban automated access.
+
+## Tools by researcher
+
+- **Housing** (`apartment.py`): `check_building` (open violations, tenant problems, rats, bedbugs), `check_landlord` (owner and their other buildings), `check_neighborhood` (noise and subway), `compare_neighborhoods` (per-1,000-apartment counts, bedbug share and rat share over a neighborhood's ZIP codes). Every result names its datasets with links and says what the records cannot show.
+- **Events** (`events.py`): `events_near_neighborhoods` (counts free Parks events and NYC for FREE listings within about 1.5 km of up to three neighborhoods), `find_free_events`, `find_freebies`, `get_forecast`, `build_itinerary`, `estimate_wait_time`, `curb_hunt_score`, `freebie_checklist`.
+- **Shopping** (`shopping.py`): `search_products_that_fit` (Amazon search under a budget, then checks each product's listed size against the space).
+
+Tools return errors as plain messages with a hint instead of raising, so the model can recover.
+
+## Sample queries
+
+The data was read on 2026-11-10, and "this weekend" is Nov 14-15, 2026. City records change, so exact numbers may differ when you run these. For each query the "no tools" answer is the same model (`gemini-3.5-flash-lite`) with no system prompt and no tools.
+
+### 1. Comparing two neighborhoods
+
+> Compare Astoria and Morningside Heights for a student: housing records and free things to do this weekend.
+
+**Expected answer and where it comes from**
+
+| | Astoria | Morningside Heights | Source |
 |---|---|---|---|
-| Apartments | xz2843 | Checks a building before you sign: housing violations, tenant complaints, rats, bedbugs, the landlord, noise and the subway. Compares several addresses and ranks them by what matters to you. | Live |
-| Free events | usm2104 | Finds free events, pop-ups and giveaways, estimates the wait, and builds a timed day plan from wherever you start. | Live |
-| Furnish | sz3410 | Finds furniture on Amazon that fits your budget and your space: it searches, then checks each product's listed size against your measurements and says whether it fits, may fit, or is unknown. | Live |
+| Open class C violations per 1,000 apartments | 92.1 | 265.8 | Housing Maintenance Code Violations (`wvxf-dwi5`), counted over the neighborhood's ZIP codes |
+| Tenant problems per 1,000 apartments (12 months) | 178.4 | 457.1 | Complaints and Problems (`ygpa-z7cr`) |
+| Buildings with bedbug filings | 1.6% | 4.9% | Bedbug Reporting (`wz6d-d3jb`) |
+| Rat inspections finding rats | 31.9% of 897 | 12.9% of 4,423 | Rodent Inspection (`p937-wjvj`) |
+| Free NYC Parks events within 1.5 km, Nov 14-15 | 1 | 5 | NYC Parks Events feed |
+| NYC for FREE listings within 1.5 km | 0 | 0 | nycforfree.co/events |
 
-## Sample queries to try
+It should also say that Morningside Heights is described by ZIP 10027, which mostly covers its neighbors, and that fewer listings can mean fewer published events, not fewer events.
 
-1. **Apartments:** `Compare 600 W 113th St and 543 W 125th St in Manhattan.`
-2. **Free events:** `Plan my Saturday from Columbia University. I want free stuff and not too much walking.`
-3. **Free events (wait times):** `How long will the line be at a free coffee pop-up on Saturday at noon?`
+**Agent answer** (35 s; the Lead sends the housing and events researchers out at the same time, and the Writer builds a cited table of the figures above, the closest events with links, and a "What the data can't tell us" section).
 
-4. **Furnish:** `I need a standing desk under $200. My wall space is 48 inches wide and 24 inches deep.`
+**Same model, no tools:** a long general write-up of each neighborhood's vibe, housing stock, commute and typical prices. It has no numbers from city records, no events for this weekend and no sources, and it does not say that it has no access to current data.
 
-(The Furnish helper needs a SerpApi key on the server. If it answers that product search is unavailable, the key is missing or its quota is used up.)
+### 2. One building
 
-## Tools
+> How is the building at 600 W 113th St, Manhattan? Any heat or pest problems, and who owns it?
 
-All tools live in one agent (`app.py`); `tools.py` merges each helper's tools. Every tool returns errors as a plain message with a hint (for example "No building record found, check the address") instead of raising, so the model can recover.
+**Expected answer and where it comes from**
+- Owner: Trustees of Columbia University, which has 155 registered buildings with 1,505 open violations (Multiple Dwelling Registrations `tesw-yqqr`, Registration Contacts `feu5-w2e2`).
+- 6 open violations at the building (3 class A, 3 class B), such as defective floor tiles in public halls and a missing annual bedbug report (Housing Maintenance Code Violations `wvxf-dwi5`).
+- 0 tenant problems reported in the last 12 months (Complaints and Problems `ygpa-z7cr`).
+- Rat inspections on the tax lot in the last 12 months all passed (Rodent Inspection `p937-wjvj`).
+- Latest bedbug report, July 3, 2023: 1 infested unit out of 294 (Bedbug Reporting `wz6d-d3jb`).
+- It should say that no heat records were found and that an empty record does not prove nothing is wrong.
 
-### Apartments (`apartment.py`)
+**Agent answer** (46 s; housing researcher calls `check_building`, `check_landlord` and `check_neighborhood`): the facts above, each linked to its dataset, with the limits of the records.
 
-There are many apartment searching websites and apps, but they do not tell you everything about the apartment, like whether the building has rats, heat problems or a landlord with a bad record. Those hidden red flags can change your decision. To use it, give the agent one or more NYC addresses and what matters to you, and it checks city records for each one and ranks them. Everything comes from free NYC and New York State open data, with no API key.
+**Same model, no tools:** says it has no access to building records, then lists websites to check (HPD Online, DOB BIS, Who Owns What). It gives no facts about the building.
 
-- `check_building`: open housing-code violations by class with the worst ones described, problems tenants reported in the last 12 months (heat, pests, leaks), the last three rat inspections, the latest bedbug report, and basic facts like year built and number of units.
-- `check_landlord`: the owner on the building's housing registration and when that registration ended. If the owner is a company, it also counts every building registered under the same name and their open violations.
-- `check_neighborhood`: 311 noise complaints within about a block in the last 12 months, and subway stations within about a 10-minute walk with their lines.
+### 3. Free events near a neighborhood
 
-If an address does not match a real NYC building, the tool says what it matched and the agent asks you to confirm instead of guessing.
+> What free events and giveaways are near Morningside Heights this weekend?
 
-### Free events (`events.py`)
+**Expected answer and where it comes from:** 5 free NYC Parks events within 1.5 km on Nov 14-15, including Winterization Workday (Nov 15, 0.3 km), Outdoor Skills: Survival 101 (Nov 14, 0.6 km) and It's My Park at Bloomingdale Playground (Nov 15, 1.2 km), and no NYC for FREE giveaways listed nearby (NYC Parks Events feed and nycforfree.co/events).
 
-Free things to do in NYC are spread across city, park and brand listings, and a list of events does not tell you how to spend a day. Tell the agent when you want to go and where you are starting, and it finds free events, pop-ups and giveaways, estimates the wait at each, and builds a timed plan with travel between stops.
+**Agent answer** (about 10 s, only the events researcher is sent out): the counts and the three closest events, each with its link, and what the counts cannot show.
 
-- `find_free_events`: free NYC Parks events by date, borough and keyword *(external data: NYC Parks events feed)*
-- `find_freebies`: pop-ups, giveaways, sampling and free food from the [NYC for FREE](https://www.nycforfree.co) listings *(external data; we read their public events page lightly, cache it for 30 minutes, and credit and link back)*
-- `get_forecast`: the forecast for a date *(external data: Open-Meteo)*
-- `curb_hunt_score`: our own 0-100 score for how good a day is for finding free curbside items in a neighborhood, from move-out timing, weekday, neighborhood and rain. A heuristic, not data.
-- `estimate_wait_time`: our own estimate of how long a line will be, from event type, day, start time and weather. An estimate, not live data. For real-time crowd reports we link to [What is this line for?](https://www.whatisthislinefor.nyc/).
-- `build_itinerary`: turns events into a timed plan. Short events are fixed-time, long or all-day ones are flexible visits, each next stop is the closest one that fits, and travel time and expected wait are added.
-- `freebie_checklist`: what to bring, check and avoid for free furniture, books, clothes, electronics and plants
+**Same model, no tools:** says it cannot see live events and suggests checking the Columbia events calendar, local libraries and neighborhood sites. It names no actual event.
 
-### Furnish (`shopping.py`)
+### Bonus: a question the data cannot answer
 
-The shopping helper finds furniture and other home items on Amazon that fit both the user's budget and the space they have. The user says what they want, how much they can spend, and optionally how wide, deep or tall the item can be. It is meant to give New Yorkers a smoother move-in.
+> What is the typical monthly rent for a studio in Astoria?
 
-- `search_products_that_fit`:
-  1. Searches Amazon through SerpApi's [Amazon Search API](https://serpapi.com/amazon-search-api) and keeps only results at or under the budget.
-  2. Reads each product's dimensions from its title, or from its product page when the title does not list them, and converts centimeters to inches.
-  3. Compares the dimensions with the user's size limits and gives each product a verdict: fits, does not fit (left out), maybe, or unknown.
-  4. Returns the products with price, rating, dimensions, verdict and link, plus a one-line summary of how many were checked and how many fit.
+**Expected answer:** none of our sources contains rents or listings, so the agent should say it cannot answer and offer what it can do.
 
-*Setup:* the tool needs a SerpApi key in the `SERPAPI_API_KEY` environment variable.
+**Agent answer:** the Lead sends no researcher out. It says its researchers cannot find rents and offers housing conditions, free events or furnishing cost instead.
 
-### Shared
-
-- `get_weather`: current weather *(external data: Open-Meteo)*
-
-## How it works
-
-- `app.py`: FastAPI server and the agent loop. It calls Gemini through LiteLLM, runs any tools the model asks for, and repeats until the model answers. Sessions are kept in memory by `session_id`, and the page keeps a separate session per helper.
-- `POST /chat` takes `{message, session_id}` and returns `{response, session_id, tool_calls}`, where each tool call has its `name`, `args` and `result`.
-- `index.html`: the whole frontend. It lists the helpers, shows example questions and priority chips, renders markdown answers, and draws a card for each tool call.
-- The prompt includes today's date and time in New York so "this weekend" and "now" work.
-
-## Things we were careful about
-
-- **Sources.** Each answer comes from tool results. The prompts tell the models not to invent events, buildings or stops.
-- **Scraping.** We did not scrape sites whose terms forbid it. What is this line for? bans automated access, so we estimate waits ourselves and link to it.
-- **Estimates are labeled.** Wait times and the curb score are heuristics, and the agent says so.
+**Same model, no tools:** answers confidently with a range of $1,900 to $2,500 "as of mid-2024" from memory, with no source.
 
 ## Run it locally
 
 1. A GCP project with billing and the Vertex AI API enabled.
 2. `gcloud auth application-default login`
-3. Optional, for the Furnish helper: `export SERPAPI_API_KEY=your-key` (never commit the key)
-4. `uv run app.py`, then open http://localhost:8000
+3. `export GOOGLE_CLOUD_PROJECT=your-project VERTEXAI_PROJECT=your-project`
+4. Optional, for the shopping researcher: `export SERPAPI_API_KEY=your-key` (never commit the key)
+5. `uv run app.py`, then open http://localhost:8000
 
 ## Deployment
 
-Google Cloud Run, built from the `Dockerfile`, with continuous deploy from the `main` branch of this repo. Every push to `main` redeploys in about three minutes. The service needs the `SERPAPI_API_KEY` environment variable for Furnish, and its service account needs the Vertex AI User role for Gemini.
+Google Cloud Run, built from the `Dockerfile`, with continuous deploy from the `main` branch of this repo. The service needs the `SERPAPI_API_KEY` environment variable for the shopping researcher, and its service account needs the Vertex AI User role for Gemini. A full research run takes 10 to 110 seconds, inside Cloud Run's default 300-second request timeout, and the agent stops starting new work after 240 seconds.
