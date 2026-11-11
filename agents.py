@@ -229,8 +229,8 @@ def _findings_text(findings: list[dict]) -> str:
 WRITER_PROMPT = (
     "You write the final answer for a person settling into New York City, from what the research team found.\n"
     "- Use only the findings below. Add no facts, numbers, places or prices of your own.\n"
-    "- Start with a short direct answer to what they asked, then give the evidence, organized by topic (housing "
-    "records, free things nearby, furnishing cost). A small table is fine for comparing neighborhoods.\n"
+    "- Start with a short direct answer to what they asked, then give the evidence, organized by the topics the "
+    "findings cover. A small table is fine for comparing neighborhoods.\n"
     "- Keep every source link from the findings, as a markdown link right after the fact it supports.\n"
     "- Say \"our estimate\" for anything the findings call an estimate, and never present it as data.\n"
     "- Add a short section, \"What the data can't tell us\", from the limits in the findings, and name any part of "
