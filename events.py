@@ -1,7 +1,9 @@
 """Free-events helper (Usman): free events, pop-ups, giveaways, wait estimates and day itineraries.
 
 Exports EVENTS_TOOLS (schemas the model sees) and EVENTS_TOOL_MAP (name -> function); tools.py merges them.
+The events researcher at the end of the file bundles the tools with the instructions for using them.
 Errors come back as {"error": ...} with a hint the model can act on instead of raising.
+Results from external data name their source with a link, and say what the data cannot show.
 """
 
 import html as html_lib
@@ -23,6 +25,11 @@ PARKS_EVENTS_URL = "https://www.nycgovparks.org/xml/events_300_rss.json"
 # Parks feed park ids start with a borough letter.
 BOROUGH_PREFIX = {"M": "Manhattan", "B": "Brooklyn", "Q": "Queens", "X": "Bronx", "R": "Staten Island"}
 NYC_LAT, NYC_LON = 40.7128, -74.0060
+
+# Where a fact came from: the dataset's name and the link to its page.
+PARKS_SOURCE = {"dataset": "NYC Parks Events", "link": "https://www.nycgovparks.org/events"}
+FREEBIES_SOURCE = {"dataset": "NYC for FREE events", "link": "https://www.nycforfree.co/events"}
+FORECAST_SOURCE = {"dataset": "Open-Meteo weather forecast", "link": "https://open-meteo.com/"}
 
 
 NYC_TZ = ZoneInfo("America/New_York")
@@ -164,6 +171,8 @@ def find_free_events(
         "total_matches": len(results),
         "showing": min(limit, len(results)),
         "note": "NYC Parks events are free to attend unless the listing says registration or a fee applies.",
+        "limits": "Only events NYC Parks has published, usually the next few weeks. An empty result means none were listed, not that nothing is happening.",
+        "sources": {"events": PARKS_SOURCE},
         "events": results[:limit],
     })
 
@@ -276,7 +285,8 @@ def find_freebies(
         "searched": f"{start} to {end}",
         "total_matches": len(results),
         "showing": min(limit, len(results)),
-        "source": "NYC for FREE (nycforfree.co). Credit them and include the link when sharing results.",
+        "limits": "Only what NYC for FREE has listed. Giveaways often run out early, and a listing does not guarantee the item is still available.",
+        "sources": {"events": FREEBIES_SOURCE},
         "events": results[:limit],
     })
 
@@ -291,7 +301,7 @@ def get_forecast(date_str: str | None = None) -> str:
     except ValueError:
         return _err("date must look like YYYY-MM-DD, e.g. 2026-10-03.")
     try:
-        return json.dumps(_forecast(target))
+        return json.dumps({**_forecast(target), "sources": {"forecast": FORECAST_SOURCE}})
     except requests.RequestException as e:
         return _err(f"Weather service failed: {e}. Forecasts only reach about 16 days ahead.")
 
@@ -365,6 +375,8 @@ def curb_hunt_score(neighborhood: str, date_str: str | None = None) -> str:
         "verdict": label,
         "reasons": reasons,
         "weather": weather,
+        "limits": "Our own heuristic, not data: the neighborhood ratings are our judgment and nothing here counts real curbside items.",
+        "sources": {"forecast": FORECAST_SOURCE} if weather else {},
         "known_neighborhoods": sorted(NEIGHBORHOODS) if hood == 5 and key not in NEIGHBORHOODS else None,
     })
 
@@ -474,6 +486,7 @@ LANDMARKS = {
     "brooklyn museum": (40.6712, -73.9636), "lower east side": (40.7150, -73.9843), "east village": (40.7265, -73.9815),
     "west village": (40.7358, -74.0036), "soho": (40.7233, -74.0030), "chelsea": (40.7465, -74.0014),
     "midtown": (40.7549, -73.9840), "upper west side": (40.7870, -73.9754), "upper east side": (40.7736, -73.9566),
+    "bushwick": (40.6944, -73.9213), "morningside heights": (40.8100, -73.9626),
 }
 MAX_LEG_MIN = 45  # don't send people across the city for one stop
 
@@ -645,6 +658,108 @@ def build_itinerary(
     }, ensure_ascii=False)
 
 
+# --- Tool 5b (external data): free events near whole neighborhoods ---
+
+MAX_NEIGHBORHOODS = 3
+EXAMPLES_SHOWN = 3
+
+
+def events_near_neighborhoods(
+    neighborhoods: list[str],
+    start_date: str | None = None,
+    end_date: str | None = None,
+    radius_km: float = 1.5,
+) -> str:
+    """For one to three neighborhoods, count the free Parks events and NYC for FREE listings within a radius."""
+    if not neighborhoods or not isinstance(neighborhoods, list):
+        return _err("Pass 'neighborhoods' as a list of one to three NYC neighborhood names, e.g. ['Astoria', 'Bushwick'].")
+    sat, sun = _next_weekend(_today())
+    try:
+        start = _parse_date(start_date, sat)
+        end = _parse_date(end_date, sun)
+    except ValueError:
+        return _err("Dates must look like YYYY-MM-DD, e.g. 2026-10-03.")
+    radius = max(0.3, min(float(radius_km), 5.0))
+
+    places, unmatched = [], []
+    for name in neighborhoods[:MAX_NEIGHBORHOODS]:
+        found = _resolve_place(str(name))
+        if found:
+            places.append((str(name).strip().title(), found[0], found[1]))
+        else:
+            unmatched.append(str(name))
+    if not places:
+        return _err(f"Couldn't locate {unmatched}. Use NYC neighborhood names such as 'Astoria' or 'Park Slope'.")
+
+    listed, problems, without_location = [], [], 0
+    try:
+        for ev in requests.get(PARKS_EVENTS_URL, timeout=15).json():
+            try:
+                ev_date = datetime.strptime(ev["startdate"], "%Y-%m-%d").date()
+            except (KeyError, ValueError):
+                continue
+            if not (start <= ev_date <= end) or "cancel" in (ev.get("title") or "").lower():
+                continue
+            coords = (ev.get("coordinates") or "").split(",")
+            try:
+                lat, lon = float(coords[0]), float(coords[1])
+            except (ValueError, IndexError):
+                without_location += 1
+                continue
+            listed.append(("parks", html_lib.unescape(ev.get("title") or ""), ev["startdate"], lat, lon, ev.get("link")))
+    except (requests.RequestException, ValueError) as e:
+        problems.append(f"NYC Parks events feed failed: {e}")
+    try:
+        for r in _load_freebies():
+            if r["end"] < start or r["start"] > end:
+                continue
+            if r["lat"] is None or r["lon"] is None:
+                without_location += 1
+                continue
+            listed.append(("freebies", r["title"], max(r["start"], start).isoformat(), r["lat"], r["lon"], r["link"]))
+    except requests.RequestException as e:
+        problems.append(f"nycforfree.co could not be reached: {e}")
+    if len(problems) == 2:
+        return _err("; ".join(problems) + ". Tell the user and offer to try again.")
+
+    report = []
+    for name, lat, lon in places:
+        near = sorted(
+            ((_haversine_km(lat, lon, e[3], e[4]), e) for e in listed if _haversine_km(lat, lon, e[3], e[4]) <= radius),
+            key=lambda pair: (pair[0], pair[1][2]),
+        )
+        report.append({
+            "neighborhood": name,
+            "free_parks_events": sum(1 for _, e in near if e[0] == "parks"),
+            "freebies_and_popups": sum(1 for _, e in near if e[0] == "freebies"),
+            "closest_examples": [
+                {"title": e[1], "date": e[2], "from": "NYC Parks" if e[0] == "parks" else "NYC for FREE",
+                 "km_away": round(km, 1), "link": e[5]}
+                for km, e in near[:EXAMPLES_SHOWN]
+            ],
+        })
+
+    result = {
+        "searched": f"{start} to {end}",
+        "radius_km": radius,
+        "neighborhoods": report,
+        "limits": (
+            "Counts only listings that have map coordinates, on two sites: NYC Parks and NYC for FREE. "
+            "Distance is a straight line from one point standing for the neighborhood, so a neighborhood's edges "
+            "may be missed or a neighbor's events included. Fewer listings can mean fewer events or just fewer "
+            "published ones."
+        ),
+        "sources": {"parks_events": PARKS_SOURCE, "freebies_and_popups": FREEBIES_SOURCE},
+    }
+    if unmatched:
+        result["not_found"] = f"Couldn't locate {unmatched}. Ask the user for another name."
+    if without_location:
+        result["skipped_without_location"] = without_location
+    if problems:
+        result["partial"] = "; ".join(problems) + ". Counts leave out that source."
+    return json.dumps(result, ensure_ascii=False)
+
+
 # --- Tool 6 (original): hunting checklist ---
 
 CHECKLISTS = {
@@ -736,7 +851,12 @@ EVENTS_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_forecast",
-            "description": "Forecast (high/low in F, chance of rain) for New York City on one date, up to about 16 days ahead.",
+            "description": (
+                "Get the forecast for New York City on one date: the high and low in degrees Fahrenheit and the "
+                "chance of rain in percent. Use it when a plan or a trip depends on a future day's weather, up to "
+                "about 16 days ahead. For the weather right now use get_weather. Returns an error if the date is "
+                "too far ahead or not in YYYY-MM-DD form."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -790,9 +910,12 @@ EVENTS_TOOLS = [
         "function": {
             "name": "build_itinerary",
             "description": (
-                "Build a timed one-day plan from events found with find_free_events: it orders them by time, "
-                "adds travel time between stops, estimates the wait at each, and skips events that clash or "
-                "can't be reached in time. Pass the events exactly as returned by find_free_events."
+                "Build a timed one-day plan from events found with find_free_events or find_freebies: it orders "
+                "them by time, adds travel time between stops, estimates the wait at each, and skips events that "
+                "clash or can't be reached in time. Pass the events exactly as returned by those tools. Use it "
+                "only when the user wants a plan for one day, not to list or count events. Returns the stops "
+                "with arrival and leave-by times, the events it skipped and why, and a disclaimer that waits "
+                "are estimates."
             ),
             "parameters": {
                 "type": "object",
@@ -830,6 +953,34 @@ EVENTS_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "events_near_neighborhoods",
+            "description": (
+                "Count and sample the free events near one to three NYC neighborhoods in a date range: free NYC "
+                "Parks events and NYC for FREE pop-ups and giveaways within a radius (default 1.5 km) of each "
+                "neighborhood. Use it to compare neighborhoods or to ask what is free near a neighborhood; use "
+                "find_free_events or find_freebies to list events by borough or keyword. Defaults to the coming "
+                "Saturday-Sunday. Returns, per neighborhood, the number of each kind and the closest examples "
+                "with links, plus what the counts cannot show."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "neighborhoods": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "One to three NYC neighborhood names, e.g. ['Astoria', 'Bushwick'].",
+                    },
+                    "start_date": {"type": "string", "description": "First day, YYYY-MM-DD. Omit for this weekend."},
+                    "end_date": {"type": "string", "description": "Last day, YYYY-MM-DD. Omit for this weekend."},
+                    "radius_km": {"type": "number", "description": "How far from the neighborhood to look, 0.3 to 5 km (default 1.5)."},
+                },
+                "required": ["neighborhoods"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "freebie_checklist",
             "description": "What to bring, check and avoid when picking up free items of one kind.",
             "parameters": {
@@ -850,5 +1001,49 @@ EVENTS_TOOL_MAP = {
     "curb_hunt_score": curb_hunt_score,
     "estimate_wait_time": estimate_wait_time,
     "build_itinerary": build_itinerary,
+    "events_near_neighborhoods": events_near_neighborhoods,
     "freebie_checklist": freebie_checklist,
+}
+
+
+# --- The events researcher: the tools with the instructions for using them ---
+
+EVENTS_RESEARCHER = {
+    "name": "events",
+    # what a lead agent reads to decide whether a task belongs to this researcher
+    "description": (
+        "Looks up free things to do in NYC: free NYC Parks events, and free pop-ups, giveaways and samples from "
+        "NYC for FREE. For named neighborhoods it counts the free listings nearby and gives the closest examples. "
+        "It can also list events by date, borough or keyword, forecast a date, build a timed one-day plan, and "
+        "estimate waits and curbside-find odds (our own estimates, labeled as such). Send it a task when the "
+        "question is about free events or giveaways, in a neighborhood or on a day. It cannot find paid events, "
+        "tickets, live crowds or anything outside those two listings."
+    ),
+    # what the researcher itself is told
+    "instructions": (
+        "You research one task about free things to do in New York City, using only your tools, and report what "
+        "the listings say.\n"
+        "- Free things near named neighborhoods, or a comparison of neighborhoods: call events_near_neighborhoods "
+        "once, with every neighborhood named in the task and the dates the task gives.\n"
+        "- A list of free events by borough, keyword or date: call find_free_events (NYC Parks) for parks, "
+        "classes and community events, and find_freebies (NYC for FREE) for pop-ups, giveaways, samples and free "
+        "food. For a broad ask like \"what's free\", call both.\n"
+        "- A plan for one day: call find_free_events and find_freebies for that date, then build_itinerary with "
+        "the events exactly as returned, passing the starting place the task names. Add get_forecast when the "
+        "weather matters.\n"
+        "- Lines or how early to arrive: call estimate_wait_time. Free items on the curb: curb_hunt_score and "
+        "freebie_checklist.\n"
+        "- If a tool returns an error, say so briefly and try one fix (other dates, another spelling) once.\n"
+        "- Reply with the facts that answer the task and nothing else, at most 10 bullets. End every bullet that "
+        "comes from a listing or a forecast with its source as a markdown link, taken from \"sources\" in the tool "
+        "result, for example ([NYC Parks Events](https://www.nycgovparks.org/events)).\n"
+        "- Wait times, itineraries and curb scores are our own estimates, not data: say \"our estimate\" in the "
+        "bullet and do not give them a source link.\n"
+        "- Use only events the tools returned. Never invent an event, a place or a time, and never call something "
+        "free that the tools did not list as free.\n"
+        "- In a last bullet, say what the listings cannot show, from \"limits\" or \"disclaimer\" in the tool "
+        "result, and name any part of the task the tools could not answer."
+    ),
+    "tools": EVENTS_TOOLS,
+    "tool_map": EVENTS_TOOL_MAP,
 }
