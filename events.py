@@ -809,8 +809,11 @@ EVENTS_TOOLS = [
             "name": "find_free_events",
             "description": (
                 "Search free NYC Parks events (fitness classes, concerts, movies, workshops, tours) "
-                "in a date range. Defaults to the coming Saturday-Sunday. Returns titles, times, "
-                "boroughs, parks, coordinates and links."
+                "in a date range, optionally for one borough or a keyword. Use it for parks, classes and "
+                "community events; use find_freebies for pop-ups and giveaways, and events_near_neighborhoods "
+                "to count what is near a neighborhood. Defaults to the coming Saturday-Sunday. Returns titles, "
+                "dates, times, boroughs, parks, coordinates and links, plus a note on what the listing does "
+                "not guarantee."
             ),
             "parameters": {
                 "type": "object",
@@ -854,7 +857,7 @@ EVENTS_TOOLS = [
             "description": (
                 "Get the forecast for New York City on one date: the high and low in degrees Fahrenheit and the "
                 "chance of rain in percent. Use it when a plan or a trip depends on a future day's weather, up to "
-                "about 16 days ahead. For the weather right now use get_weather. Returns an error if the date is "
+                "about 16 days ahead. It does not give the weather right now. Returns an error if the date is "
                 "too far ahead or not in YYYY-MM-DD form."
             ),
             "parameters": {
@@ -982,7 +985,12 @@ EVENTS_TOOLS = [
         "type": "function",
         "function": {
             "name": "freebie_checklist",
-            "description": "What to bring, check and avoid when picking up free items of one kind.",
+            "description": (
+                "Get a practical checklist for picking up free items from the curb or a giveaway: what to bring, "
+                "what to check on the item and what to avoid. Use it after the user says what kind of item they "
+                "are after. Takes one kind (furniture, books, clothes, electronics or plants) and returns three "
+                "lists, or an error naming the kinds it has."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
