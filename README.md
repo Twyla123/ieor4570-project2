@@ -6,6 +6,12 @@ Ask one question about settling into New York City and a small team of agents re
 
 A three-student IEOR 4570 project (Project 2: A Data Exploration Agent, path: Deep Research). Authors: usm2104, xz2843, sz3410.
 
+## Why we built this
+
+We are three students who came to New York, and settling in meant three decisions that each depend on a different public dataset. Where do I live? What is there to do nearby without spending much? What does it cost to set up a room? The city publishes the housing records, but they are scattered across datasets nobody reads before signing a lease. Free events are spread over park, city and brand listings. Prices change daily.
+
+A chatbot with no tools knows none of this live, and it answers anyway. Asked for a studio rent in Astoria, the same model we use answered with a range "as of mid-2024" from memory and no source. So we built a research desk instead: a Lead that plans, one researcher per data source (each one of us owns one), and a Writer that reports with a source link on every fact. It shows the evidence and what each choice trades off, says what the data cannot tell you, and does not tell you where to live.
+
 ## Who it is for
 
 Anyone choosing where to live or settling in: a student who just arrived, a last-semester student deciding where to stay after graduating, or anyone moving to a new neighborhood. It answers questions like "which of these neighborhoods has better-kept buildings and more free things to do?" and "how is this building?". It shows the evidence and what it cannot tell you. It does not tell you which place to pick.
