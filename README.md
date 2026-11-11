@@ -2,7 +2,7 @@
 
 Ask one question about settling into New York City and a small team of agents researches it in parallel and writes you a cited report. It compares neighborhoods and buildings using the city's housing records, finds free events and giveaways nearby, and checks what furnishing a room costs.
 
-**Live app:** DEPLOY_URL_GOES_HERE (sign in with a Columbia Google account if prompted)
+**Live app:** https://ieor4570-project2-git-770026520963.us-east1.run.app (sign in with a Columbia Google account if prompted)
 
 A three-student IEOR 4570 project (Project 2: A Data Exploration Agent, path: Deep Research). Authors: usm2104, xz2843, sz3410.
 
