@@ -1,13 +1,15 @@
-"""search_products_that_fit: Amazon search filtered by budget and by the space the user has.
+"""Shopping tool and researcher: what it costs to furnish an NYC apartment, and whether each item fits.
 
-How it plugs into the starter (three lines in tools.py, after TOOLS and TOOL_MAP are defined):
-
-    from shopping_tool import SHOPPING_TOOL, search_products_that_fit
-    TOOLS.append(SHOPPING_TOOL)
-    TOOL_MAP["search_products_that_fit"] = search_products_that_fit
+One tool for the agent:
+- search_products_that_fit: searches Amazon within a budget and checks each product's listed size against the
+  space the user has (width, depth, height in inches), with a fit verdict: yes, no (left out), maybe or unknown.
 
 Data comes from SerpApi's Amazon engines (https://serpapi.com/amazon-search-api).
 Put your key in the SERPAPI_API_KEY environment variable.
+
+Every result links to each product and says what the search cannot show, so facts can be cited.
+The shopping researcher at the end of the file bundles the tool with the instructions for using it;
+agents.py imports SHOPPING_RESEARCHER, and tools.py imports SHOPPING_TOOL and search_products_that_fit.
 
 API cost per tool call: 1 search, plus up to MAX_DETAIL_LOOKUPS product lookups when the
 user gave size limits and a listing's title does not state its dimensions.
@@ -280,12 +282,18 @@ def _search(query, max_price, max_width_in, max_depth_in, max_height_in, max_res
         if not by_verdict["yes"]:
             summary += " None is a confirmed fit; say so, and suggest relaxing a measurement or the budget."
 
-    return {
+        return {
         "query": query,
         "max_price": max_price,
         "limits_in": {a: v for a, v in limits.items() if v is not None},
         "summary": summary + " Prices are list prices before tax.",
         "products": products,
+        "source": {"dataset": "Amazon search results (via SerpApi)", "link": f"https://www.amazon.com/s?k={query.replace(' ', '+')}"},
+        "limits": (
+            "Prices and availability are a snapshot from Amazon at search time and change often. Dimensions are read "
+            "from listing text and can be missing or wrong. Ratings are Amazon's own. Shipping costs, delivery times "
+            "and assembly are not checked."
+        ),
     }
 
 
@@ -349,4 +357,45 @@ SHOPPING_TOOL = {
             "required": ["query", "max_price"],
         },
     },
+}
+
+
+
+SHOPPING_TOOLS = [SHOPPING_TOOL]
+
+SHOPPING_TOOL_MAP = {
+    "search_products_that_fit": search_products_that_fit,
+}
+
+
+
+SHOPPING_RESEARCHER = {
+    "name": "shopping",
+    # what the lead agent reads to decide whether a task belongs to this researcher
+    "description": (
+        "Searches Amazon for furniture, appliances, storage and decor within a budget, and checks each product "
+        "against the space available (width, depth, height in inches). Returns live prices, ratings, product "
+        "links and whether each product fits. Send it a task when the question is about what to buy for a home "
+        "or how much furnishing would cost. Give it a budget per item or a total budget, and measurements if "
+        "known. It cannot check stores other than Amazon, used furniture, delivery times or assembly."
+    ),
+    # what the researcher itself is told
+    "instructions": (
+        "You research one shopping task for someone setting up a home in New York City, using only your tool, "
+        "and report what Amazon has.\n"
+        "- Call search_products_that_fit once for each kind of item in the task, with short keywords such as "
+        "'twin bed frame' or 'narrow bookshelf'. Pass size limits only when the task gives measurements.\n"
+        "- If the task gives a total budget for several items, split it across the items in a sensible way and "
+        "say how you split it.\n"
+        "- If the task gives no budget at all, do not invent one: reply that a budget is needed and stop.\n"
+        "- For each item, report the best one to three options that fit: name, price, rating, and the fit verdict. "
+        "When several items are asked for, add up the cheapest fitting option of each and state the total.\n"
+        "- Reply with the facts that answer the task and nothing else, at most 10 bullets. End every bullet about "
+        "a product with its link as a markdown link, for example ([Product name](https://www.amazon.com/dp/...)).\n"
+        "- Use only what the tool returned. Do not add products, prices or brands you know yourself.\n"
+        "- In a last bullet, say what the results cannot show, from \"limits\" in the tool result, and name any "
+        "part of the task the tool could not answer."
+    ),
+    "tools": SHOPPING_TOOLS,
+    "tool_map": SHOPPING_TOOL_MAP,
 }
