@@ -1,879 +1,23 @@
 """Housing tools: what a listing won't tell you about an NYC apartment building or neighborhood.
 
-Four tools for the agent, all built on free NYC and New York State open data:
+Four tools for the agent, all built on free NYC and New York State open data and the US Census:
 - check_building: the building's age, size and type, its open housing-code violations, the problems tenants
   reported in the last 12 months, its last rat inspections and its latest bedbug report.
 - check_landlord: who owns the building, and the open violations across all buildings that owner registers.
 - check_neighborhood: noise complaints on the block and the subway stations within a short walk.
-- compare_neighborhoods: one to three whole neighborhoods side by side: serious open violations and tenant
-  problems per 1,000 apartments, the share of buildings reporting bedbugs, and the share of rat inspections
-  that found rats.
+- compare_neighborhoods: one to three whole neighborhoods side by side on housing records, crime reports and
+  Census income and rent.
 
+This file holds what the agent sees: each tool's description, and the housing researcher, which bundles the
+four tools with the instructions for using them. The tools themselves live in:
+- open_data.py: asking the open data sites, dataset names and sources, finding an address
+- buildings.py: the three address tools
+- neighborhoods.py: compare_neighborhoods
 Every result names the dataset each fact came from and links to its page, so the fact can be cited.
-The housing researcher at the end of the file bundles the four tools with the instructions for using them.
 """
 
-# --- Setup: imports, web addresses, datasets and settings ---
-
-import difflib
-import json
-import math
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
-from functools import lru_cache
-
-import requests
-
-ADDRESS_SERVICE = "https://geosearch.planninglabs.nyc/v2/search"
-CITY_DATA = "https://data.cityofnewyork.us/resource/{}.json"
-STATE_DATA = "https://data.ny.gov/resource/{}.json"
-CITY_DATASET_PAGE = "https://data.cityofnewyork.us/d/{}"   # the web page that describes a city dataset
-STATE_DATASET_PAGE = "https://data.ny.gov/d/{}"
-
-# Open data datasets, by their IDs (city datasets on data.cityofnewyork.us, the subway list on data.ny.gov)
-VIOLATIONS = "wvxf-dwi5"
-RAT_INSPECTIONS = "p937-wjvj"
-BEDBUG_REPORTS = "wz6d-d3jb"
-REGISTRATIONS = "tesw-yqqr"
-CONTACTS = "feu5-w2e2"
-COMPLAINTS = "ygpa-z7cr"
-TAX_LOTS = "64uk-42ks"          # one row of facts per tax lot
-COMPLAINTS_311 = "erm2-nwe9"
-SUBWAY_STATIONS = "39hk-dx4f"   # New York State data
-
-# Each dataset's official name. A tool result names the datasets its facts came from, with a link to each.
-DATASET_NAMES = {
-    VIOLATIONS: "Housing Maintenance Code Violations",
-    RAT_INSPECTIONS: "Rodent Inspection",
-    BEDBUG_REPORTS: "Bedbug Reporting",
-    REGISTRATIONS: "Multiple Dwelling Registrations",
-    CONTACTS: "Registration Contacts",
-    COMPLAINTS: "Housing Maintenance Code Complaints and Problems",
-    TAX_LOTS: "Primary Land Use Tax Lot Output (PLUTO)",
-    COMPLAINTS_311: "311 Service Requests from 2020 to Present",
-    SUBWAY_STATIONS: "MTA Subway Stations",
-}
-
-QUERY_SECONDS = 8               # a normal query answers in about a second; this keeps a hanging dataset from holding the user for long
-AREA_QUERY_SECONDS = 30         # a count over whole ZIP codes can take 15 seconds
-RECENT_DAYS = 365               # "the last 12 months" in every tool
-NOISE_RADIUS_METERS = 150       # about one block
-SUBWAY_RADIUS_METERS = 800      # about a 10-minute walk
-WALKING_METERS_PER_MINUTE = 80
-EARTH_RADIUS_METERS = 6_371_000
-ZIP_CODE_LENGTH = 5
-IDS_PER_QUERY = 200             # keeps each query's web address short enough for the city's server
-VIOLATIONS_SHOWN = 8            # how many open violations to describe, most serious first
-RAT_INSPECTIONS_SHOWN = 3
-DESCRIPTION_LENGTH = 220        # violation descriptions are long legal text; keep the start
-
-# Settings for comparing whole neighborhoods. The compare_neighborhoods description and the housing researcher's
-# description, near the end of the file, repeat some of these values in words: change them there as well.
-SERIOUS_VIOLATION_CLASS = "C"   # the class of open violations counted (class C is immediately hazardous)
-MAX_NEIGHBORHOODS = 3           # the most neighborhoods compared in one call
-MIN_ZIP_SHARE = 0.4             # a ZIP code counts toward a neighborhood when at least this share of its bedbug filings is there
-MIN_SHARE_COVERED = 0.25        # when the ZIP codes found hold less than this share of the neighborhood, its main ZIP code is used instead
-RATE_PER_APARTMENTS = 1000      # violations and tenant problems are given per this many apartments
-NAMES_SUGGESTED = 5             # how many similar names to offer when a neighborhood name is not found
-
-# The first letter of the city's building class code says what kind of building it is.
-BUILDING_TYPES = {
-    "A": "one-family home", "B": "two-family home", "C": "walk-up apartment building",
-    "D": "elevator apartment building", "E": "warehouse", "F": "factory or industrial building",
-    "G": "garage", "H": "hotel", "I": "hospital or health facility", "J": "theatre", "K": "store building",
-    "L": "loft building", "M": "religious building", "N": "group home or institution", "O": "office building",
-    "P": "cultural or public assembly building", "Q": "outdoor recreation facility", "R": "condominium",
-    "S": "mixed residential and store building", "T": "transportation facility", "U": "utility property",
-    "V": "vacant land", "W": "school or educational building", "Y": "government building", "Z": "other",
-}
-
-# The city's own wording for the four classes (from the violations dataset's description).
-VIOLATION_CLASSES = (
-    "Class A is non-hazardous, class B is hazardous and class C is immediately hazardous. Class I is an "
-    "information order, generally issued administratively rather than after an inspection; it is not a hazard level."
-)
-
-# The city files addresses that have no building number of their own under one shared ID per borough.
-# Looking records up by a shared ID would return the records of every such address in the borough.
-SHARED_BUILDING_IDS = {"1000000", "2000000", "3000000", "4000000", "5000000"}
-
-# The errors Python raises when a reply does not have the shape the code expects (a missing field, a wrong type).
-UNEXPECTED_SHAPE = (KeyError, ValueError, TypeError, AttributeError)
-
-# What a tool returns when it cannot build its report: what happened, and what to do next.
-DATA_DOWN = {"error": "NYC's open data did not respond. Try again in a minute."}
-DATA_UNREADABLE = {"error": "NYC's open data sent back records in a form that could not be read. Try again in a minute."}
-NO_BUILDING_RECORD = {"error": (
-    "The city has no building number on file for this address, so its housing records cannot be looked up "
-    "reliably. Ask the user to check the address or to give the building's main street address."
-)}
-
-# What housing records cannot show, sent with every result built on them.
-RECORD_LIMITS = (
-    "City records show where an inspector went and where a tenant reported a problem, not every problem: "
-    "an empty or short record does not prove there is nothing wrong."
-)
-
-
-# --- Plumbing: asking the open data sites ---
-
-
-def city_data(dataset: str, params: dict, site: str = CITY_DATA, seconds: int = QUERY_SECONDS) -> list:
-    """Run one query against an open data dataset (NYC's site unless another site is given).
-
-    The servers sometimes answer with an error, so this tries up to 3 times, waiting 2 and then
-    4 seconds in between, before passing the error on to the tool that asked. Rows always come
-    as a list, so any other reply is passed on as unreadable.
-    """
-    for attempt in range(3):
-        try:
-            reply = requests.get(site.format(dataset), params=params, timeout=seconds)
-            reply.raise_for_status()
-            rows = reply.json()
-            break
-        except requests.RequestException:
-            if attempt == 2:
-                raise
-            time.sleep(2 * (attempt + 1))
-    if not isinstance(rows, list):  # rows come as a list; a single object is an error message from the site
-        raise ValueError("the open data site did not send a list of rows")
-    return rows
-
-
-def source(dataset: str, page: str = CITY_DATASET_PAGE) -> dict:
-    """Where a fact came from: the dataset's official name and the link to its page."""
-    return {"dataset": DATASET_NAMES[dataset], "link": page.format(dataset)}
-
-
-def one_year_ago() -> str:
-    """The date where "the last 12 months" starts (RECENT_DAYS days before today), as text such as "2025-10-03"."""
-    return (date.today() - timedelta(days=RECENT_DAYS)).isoformat()
-
-
-def counts_by(rows: list, field: str) -> dict:
-    """Add up the count column "n" of grouped query rows, one total per value of the given field."""
-    counts = {}
-    for row in rows:
-        counts[row[field]] = counts.get(row[field], 0) + int(row["n"])
-    return counts
-
-
-def number_or_none(text: str | None) -> int | None:
-    """The open data sites send numbers as text ("294"); turn one into a number, or None if it is missing."""
-    if text in (None, ""):
-        return None
-    return int(float(text))
-
-
-# --- Finding the building ---
-
-
-def lookup_address(address: str) -> dict:
-    """Turn a street address into the IDs the city's datasets are searched by.
-
-    The address service guesses rather than saying "no match" (it turned "1600 Pennsylvania Ave
-    Washington DC" into a Brooklyn address), so the street number it found must equal the first
-    word typed. A different street with the same number can still slip through, which is why the
-    matched address is always returned for the agent to compare with what the user typed.
-    """
-    if not isinstance(address, str) or not address.strip():  # the model can send a number or nothing at all
-        return {"error": "No address was given. Ask the user for a street number, street name and borough."}
-    try:
-        reply = requests.get(ADDRESS_SERVICE, params={"text": address, "size": 1}, timeout=10)
-        reply.raise_for_status()
-        matches = reply.json()["features"]
-    except requests.RequestException:
-        return {"error": "The NYC address service is not responding. Try again in a minute."}
-    except UNEXPECTED_SHAPE:
-        return {"error": "The NYC address service sent back an answer that could not be read. Try again in a minute."}
-    if not matches:
-        return {"error": f"No NYC address matched '{address}'. Ask the user for a street number, street name and borough."}
-
-    try:
-        best = matches[0]
-        props = best["properties"]
-        if address.split()[0] != props.get("housenumber"):
-            return {"error": f"'{address}' did not match an NYC building exactly; the closest is '{props.get('label')}'. Ask the user to confirm the street number and street."}
-        longitude, latitude = best["geometry"]["coordinates"]  # the service lists longitude first
-        return {
-            "address": props["label"],
-            "bin": props["addendum"]["pad"]["bin"],    # building ID
-            "bbl": props["addendum"]["pad"]["bbl"],    # tax-lot ID (a lot can hold more than one building)
-            "latitude": latitude,
-            "longitude": longitude,
-        }
-    except UNEXPECTED_SHAPE:
-        return {"error": f"'{address}' matched a place without a building record the city's datasets can be searched by. Ask the user for a full street address."}
-
-
-# --- Building facts ---
-
-
-def open_violations(bin_id: str) -> dict:
-    """Count a building's open (not yet corrected) housing-code violations by class (A, B, C, and I for information orders)."""
-    rows = city_data(VIOLATIONS, {
-        "$select": "class, count(*) AS n",
-        "$where": f"bin = '{bin_id}' AND violationstatus = 'Open'",
-        "$group": "class",
-        "$order": "class",  # always A, B, C, I, so the same building reads the same on every run
-    })
-    return counts_by(rows, "class")
-
-
-def open_violation_details(bin_id: str) -> list:
-    """What the open violations are: up to 8 of them, most serious class first, newest first within a class."""
-    details = []
-    for violation_class in ("C", "B", "A"):
-        still_needed = VIOLATIONS_SHOWN - len(details)
-        if still_needed == 0:
-            break
-        rows = city_data(VIOLATIONS, {
-            "$select": "inspectiondate, apartment, novdescription",
-            "$where": f"bin = '{bin_id}' AND violationstatus = 'Open' AND class = '{violation_class}'",
-            # the ID breaks ties between violations inspected on the same day, so every run returns the same ones
-            "$order": "inspectiondate DESC, violationid DESC",
-            "$limit": still_needed,
-        })
-        for row in rows:
-            description = " ".join(row.get("novdescription", "").split())  # collapse line breaks and double spaces
-            details.append({
-                "class": violation_class,
-                "inspected": row.get("inspectiondate", "")[:10],
-                "apartment": row.get("apartment"),
-                "description": description[:DESCRIPTION_LENGTH],
-            })
-    return details
-
-
-def tenant_complaints(bin_id: str) -> dict:
-    """Problems tenants reported to the city's housing agency in the last 12 months, by category (heat, pests...)."""
-    rows = city_data(COMPLAINTS, {
-        "$select": "major_category, count(*) AS n",
-        "$where": f"bin = {int(bin_id)} AND received_date > '{one_year_ago()}'",
-        "$group": "major_category",
-        "$order": "n DESC",
-    })
-    by_category = counts_by(rows, "major_category")
-    return {"total_problems_reported": sum(by_category.values()), "by_category": by_category}
-
-
-def building_facts(bbl: str) -> dict | None:
-    """Basic facts about the tax lot's building from city tax records: age, size, type and owner."""
-    rows = city_data(TAX_LOTS, {
-        "$select": "yearbuilt, numfloors, unitsres, unitstotal, bldgclass, ownername",
-        "$where": f"bbl = {int(bbl)}",
-    })
-    if not rows:
-        return None
-    row = rows[0]
-    class_code = row.get("bldgclass") or ""
-    return {
-        "year_built": number_or_none(row.get("yearbuilt")) or None,  # the city records an unknown year as 0
-        "floors": number_or_none(row.get("numfloors")),
-        "residential_units": number_or_none(row.get("unitsres")),
-        "total_units": number_or_none(row.get("unitstotal")),
-        "building_type": BUILDING_TYPES.get(class_code[:1], "unknown"),
-        "owner_on_tax_record": row.get("ownername"),
-    }
-
-
-def recent_rat_inspections(bbl: str) -> list:
-    """The lot's last 3 rat inspections, newest first: date, kind of inspection and result."""
-    rows = city_data(RAT_INSPECTIONS, {
-        "$where": f"bbl = {int(bbl)} AND inspection_date IS NOT NULL",
-        "$order": "inspection_date DESC",
-        "$limit": RAT_INSPECTIONS_SHOWN,
-    })
-    inspections = []
-    for row in rows:
-        inspections.append({
-            "date": row["inspection_date"][:10],
-            "type": row.get("inspection_type"),
-            "result": row.get("result"),
-        })
-    return inspections
-
-
-def latest_bedbug_report(bin_id: str) -> dict | None:
-    """The building's most recent annual bedbug filing: infested units out of all units."""
-    rows = city_data(BEDBUG_REPORTS, {
-        "$where": f"bin = '{bin_id}' AND filing_date IS NOT NULL",
-        "$order": "filing_date DESC",
-        "$limit": 1,
-    })
-    if not rows:
-        return None
-    row = rows[0]
-    return {
-        "filed": row["filing_date"][:10],
-        "infested_units": number_or_none(row.get("infested_dwelling_unit_count")),
-        "total_units": number_or_none(row.get("of_dwelling_units")),
-    }
-
-
-# --- Landlord facts ---
-
-
-def building_owner(bin_id: str) -> dict | None:
-    """The owner named on the building's latest registration with the city, or None if it has none.
-
-    Owners register every year, and some stop: the newest registration is used and its end date is
-    returned, so the tool can say when the owner shown may be out of date. Buildings with no
-    registration carry registration ID 0, a placeholder the city shares across all of them, so 0 is
-    treated as "no registration".
-    """
-    rows = city_data(REGISTRATIONS, {"$select": "registrationid, registrationenddate", "$where": f"bin = {int(bin_id)}"})
-    registrations = [row for row in rows if row.get("registrationid") not in (None, "0")]
-    if not registrations:
-        return None
-    # a few buildings carry several registrations: take the one that ends last (the ID breaks ties)
-    registrations.sort(key=lambda row: (row.get("registrationenddate", ""), int(row["registrationid"])), reverse=True)
-    latest = registrations[0]
-    end_date = latest.get("registrationenddate", "")[:10] or None
-
-    contacts = city_data(CONTACTS, {
-        "$select": "type, corporationname, firstname, lastname",
-        "$where": f"registrationid = {latest['registrationid']}",
-    })
-    for contact in contacts:
-        if contact["type"] == "CorporateOwner" and contact.get("corporationname"):
-            return {"name": contact["corporationname"], "kind": "company", "registration_end_date": end_date}
-    for contact in contacts:
-        if contact["type"] in ("IndividualOwner", "JointOwner"):
-            name = f"{contact.get('firstname', '')} {contact.get('lastname', '')}".strip()
-            if name:
-                return {"name": name, "kind": "person", "registration_end_date": end_date}
-    return None
-
-
-def owner_violations(company: str) -> dict:
-    """How many buildings are registered under this exact company name, and their open violations by class.
-
-    One registration usually covers one building, but some cover a whole complex of dozens of
-    buildings, so buildings are counted by their building IDs, not by registrations.
-    """
-    safe_name = company.replace("'", "''")  # a ' inside a name would otherwise end the query's text early
-    rows = city_data(CONTACTS, {
-        "$select": "registrationid",
-        "$where": f"type = 'CorporateOwner' AND corporationname = '{safe_name}'",
-        "$limit": 5000,
-    })
-    unique_ids = {row["registrationid"] for row in rows}
-    registration_ids = sorted(unique_ids - {"0"})  # drop the shared "no registration" placeholder
-
-    building_ids = set()
-    violation_rows = []
-    for start in range(0, len(registration_ids), IDS_PER_QUERY):
-        id_list = ",".join(registration_ids[start:start + IDS_PER_QUERY])
-        for row in city_data(REGISTRATIONS, {
-            "$select": "bin",
-            "$where": f"registrationid in ({id_list})",
-            "$limit": 50000,
-        }):
-            if row.get("bin") not in (None, "0"):
-                building_ids.add(row["bin"])
-        violation_rows += city_data(VIOLATIONS, {
-            "$select": "class, count(*) AS n",
-            "$where": f"registrationid in ({id_list}) AND violationstatus = 'Open'",
-            "$group": "class",
-            "$order": "class",
-        })
-    counts = counts_by(violation_rows, "class")
-    return {
-        "buildings_registered": len(building_ids),
-        "open_violations_total": sum(counts.values()),
-        "open_violations_by_class": counts,
-    }
-
-
-# --- Neighborhood facts ---
-
-
-def noise_complaints(latitude: float, longitude: float) -> dict:
-    """311 noise complaints from the last 12 months within about a block, by type, most common first."""
-    rows = city_data(COMPLAINTS_311, {
-        "$select": "complaint_type, count(*) AS n",
-        "$where": (f"within_circle(location, {latitude}, {longitude}, {NOISE_RADIUS_METERS}) "
-                   f"AND created_date > '{one_year_ago()}' AND complaint_type like 'Noise%'"),
-        "$group": "complaint_type",
-        "$order": "n DESC",
-    })
-    by_type = counts_by(rows, "complaint_type")
-    return {"within_meters": NOISE_RADIUS_METERS, "total": sum(by_type.values()), "by_type": by_type}
-
-
-def straight_line_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Straight-line distance between two points on the earth, in meters (the haversine formula)."""
-    lat_change = math.radians(lat2 - lat1)
-    lon_change = math.radians(lon2 - lon1)
-    a = (math.sin(lat_change / 2) ** 2
-         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(lon_change / 2) ** 2)
-    return EARTH_RADIUS_METERS * 2 * math.asin(math.sqrt(a))
-
-
-def nearby_stations(latitude: float, longitude: float) -> list:
-    """Subway stations within about a 10-minute walk, closest first, with their daytime lines."""
-    rows = city_data(SUBWAY_STATIONS, {
-        "$select": "stop_name, daytime_routes, gtfs_latitude, gtfs_longitude",
-        "$where": f"within_circle(georeference, {latitude}, {longitude}, {SUBWAY_RADIUS_METERS})",
-    }, site=STATE_DATA)
-    stations_with_meters = []
-    for row in rows:
-        meters = straight_line_meters(latitude, longitude, float(row["gtfs_latitude"]), float(row["gtfs_longitude"]))
-        station = {
-            "station": row["stop_name"],
-            "lines": row["daytime_routes"],
-            "walk_minutes": round(meters / WALKING_METERS_PER_MINUTE),
-        }
-        stations_with_meters.append((meters, station))
-    stations_with_meters.sort(key=lambda pair: pair[0])  # closest first, by exact distance, not rounded minutes
-    return [station for meters, station in stations_with_meters]
-
-
-# --- Whole neighborhoods: finding a neighborhood's ZIP codes ---
-
-
-def same_spelling(name: str) -> str:
-    """A name in lower case with single spaces, so "Astoria  (central)" and "Astoria (Central)" read the same."""
-    return " ".join(name.lower().split())
-
-
-def plain_name(name: str) -> str:
-    """A neighborhood name in lower case without a part in brackets: "Astoria (Central)" becomes "astoria"."""
-    without_brackets = re.sub(r"\(.*?\)", "", name)
-    without_spaces_at_hyphens = re.sub(r"\s*-\s*", "-", without_brackets)
-    return " ".join(without_spaces_at_hyphens.lower().split())
-
-
-def names_of_area(area: str) -> set:
-    """The plain names one of the city's neighborhood areas answers to.
-
-    The city joins small neighborhoods into one area with hyphens, so "Astoria (East)-Woodside (North)"
-    answers to "astoria-woodside", "astoria" and "woodside".
-    """
-    names = {plain_name(area)}
-    for part in area.split("-"):
-        names.add(plain_name(part))
-    return names
-
-
-@lru_cache(maxsize=1)  # the areas do not change while the app runs: ask the city once, then reuse the answer
-def area_table() -> list:
-    """Every pairing of a ZIP code and a city neighborhood area, with the number of bedbug filings in it.
-
-    The city divides itself into named neighborhood areas, such as "Astoria (Central)", and stamps every
-    bedbug filing with its area and its ZIP code. Counting the filings by both shows which ZIP codes an
-    area covers, and how much of each ZIP code lies inside it.
-    """
-    rows = city_data(BEDBUG_REPORTS, {
-        "$select": "postcode, nta, count(*) AS n",
-        "$group": "postcode, nta",
-        "$limit": 5000,
-    }, seconds=AREA_QUERY_SECONDS)
-    # a filing without an area, or without a real ZIP code (a few carry "0"), cannot place anything
-    usable_rows = []
-    for row in rows:
-        zip_code = row.get("postcode", "")
-        if row.get("nta") and len(zip_code) == ZIP_CODE_LENGTH and zip_code.isdigit():
-            usable_rows.append(row)
-    return usable_rows
-
-
-def similar_area_names(wanted: str) -> list:
-    """Up to 5 names the city's areas answer to that contain the name asked for, or are spelled like it."""
-    known_names = set()
-    for row in area_table():
-        known_names.update(names_of_area(row["nta"]))
-    containing = sorted(name for name in known_names if wanted in name)
-    spelled_alike = difflib.get_close_matches(wanted, sorted(known_names), n=NAMES_SUGGESTED)
-    suggestions = []
-    for name in containing + spelled_alike:
-        if name not in suggestions:
-            suggestions.append(name)
-    return suggestions[:NAMES_SUGGESTED]
-
-
-def find_zip_codes(neighborhood: str) -> dict:
-    """The city areas a neighborhood name matches, and the ZIP codes counted for it.
-
-    A name with a part in brackets, written as one of the city's areas, such as "Astoria (Central)",
-    matches only that area. Any other name, such as "Astoria" or "Woodside", matches every area that
-    answers to it, so "Woodside" also covers "Astoria (East)-Woodside (North)".
-
-    ZIP codes do not follow neighborhood lines. A ZIP code counts toward the neighborhood when at least
-    40% of its bedbug filings are in the matched areas (MIN_ZIP_SHARE). Some neighborhoods hold only a
-    small part of every ZIP code they touch: when the ZIP codes found hold less than a quarter of the
-    neighborhood's own filings (MIN_SHARE_COVERED), the neighborhood gets the one ZIP code that holds
-    more of them than any other, with a note that the ZIP code is shared. The result says what share of
-    the neighborhood's filings its ZIP codes hold.
-    """
-    wanted = plain_name(neighborhood)
-    every_area = {row["nta"] for row in area_table()}
-    exact_area = []
-    if "(" in neighborhood:  # the name picks out one part of a neighborhood, the way the city names its areas
-        exact_area = sorted(area for area in every_area if same_spelling(area) == same_spelling(neighborhood))
-    if exact_area:
-        matched_areas = exact_area
-    else:
-        matched_areas = sorted(area for area in every_area if wanted in names_of_area(area))
-    if not matched_areas:
-        similar = similar_area_names(wanted)
-        hint = f" Names that look similar: {', '.join(similar)}." if similar else ""
-        return {"error": f"The city's records have no neighborhood called '{neighborhood}'.{hint} "
-                         "Ask the user which neighborhood they mean."}
-
-    filings_in_zip = {}     # ZIP code -> bedbug filings in any area
-    filings_in_match = {}   # ZIP code -> bedbug filings in the matched areas
-    for row in area_table():
-        zip_code = row["postcode"]
-        filings = int(row["n"])
-        filings_in_zip[zip_code] = filings_in_zip.get(zip_code, 0) + filings
-        if row["nta"] in matched_areas:
-            filings_in_match[zip_code] = filings_in_match.get(zip_code, 0) + filings
-
-    share_in_match = {}     # ZIP code -> the share of its filings that are in the matched areas
-    for zip_code, filings in filings_in_match.items():
-        share_in_match[zip_code] = filings / filings_in_zip[zip_code]
-    zip_codes = sorted(zip_code for zip_code, share in share_in_match.items() if share >= MIN_ZIP_SHARE)
-
-    own_filings = sum(filings_in_match.values())
-    share_covered = sum(filings_in_match[zip_code] for zip_code in zip_codes) / own_filings
-    found = {"city_areas_matched": matched_areas, "zip_codes": zip_codes}
-    if share_covered < MIN_SHARE_COVERED:
-        main_zip = max(filings_in_match, key=filings_in_match.get)
-        found["zip_codes"] = [main_zip]
-        share_covered = filings_in_match[main_zip] / own_filings
-        found["shared_zip_note"] = (
-            f"{neighborhood} does not fill enough of any ZIP code to be counted on its own. The numbers are for "
-            f"ZIP code {main_zip}, which holds more of its bedbug filings than any other ZIP code, but only about "
-            f"{round(100 * share_in_match[main_zip])}% of that ZIP code's bedbug filings are in this neighborhood, "
-            "so the numbers mostly describe its neighbors. Tell the user this."
-        )
-    found["percent_of_neighborhood_in_these_zip_codes"] = round(100 * share_covered)
-    return found
-
-
-# --- Whole neighborhoods: counting records over ZIP codes ---
-
-
-# What has been counted since the app started: (dataset, condition, ZIP code) -> {name: number}.
-# The city's site can take 15 seconds or fail, so a ZIP code is asked for once and then reused. A condition
-# holds the date where "the last 12 months" starts, so on a new day the city is asked again.
-counts_kept = {}
-
-
-def zip_numbers(dataset: str, zip_field: str, zip_codes: list, wanted: dict, condition: str = "") -> dict:
-    """Numbers per ZIP code from one dataset, in one query: {ZIP code: {name: number}}.
-
-    `wanted` names each number and gives the formula the open data site computes for it, for example
-    {"apartments": "sum(unitsres)"}. Only rows where the condition holds are counted.
-    """
-    new_zip_codes = [zip_code for zip_code in zip_codes if (dataset, condition, zip_code) not in counts_kept]
-    if new_zip_codes:
-        formulas = ", ".join(f"{formula} AS {name}" for name, formula in wanted.items())
-        quoted_zip_codes = ",".join(f"'{zip_code}'" for zip_code in new_zip_codes)
-        where = f"{zip_field} in ({quoted_zip_codes})"
-        if condition:
-            where += f" AND {condition}"
-        rows = city_data(dataset, {
-            "$select": f"{zip_field}, {formulas}",
-            "$where": where,
-            "$group": zip_field,
-        }, seconds=AREA_QUERY_SECONDS)
-        row_of_zip = {row[zip_field]: row for row in rows}
-        for zip_code in new_zip_codes:
-            row = row_of_zip.get(zip_code, {})  # a ZIP code with no matching records gets no row: every number is 0
-            counts_kept[(dataset, condition, zip_code)] = {name: number_or_none(row.get(name)) or 0 for name in wanted}
-    return {zip_code: counts_kept[(dataset, condition, zip_code)] for zip_code in zip_codes}
-
-
-def area_counts(zip_codes: list, since: str) -> dict:
-    """Every number the comparison needs, for each ZIP code: {ZIP code: {name: number}}.
-
-    Five queries, one per dataset, go to the city's site at the same time, so the tool waits for the
-    slowest one instead of for all five in a row.
-    """
-    with ThreadPoolExecutor() as pool:
-        def ask(dataset, zip_field, wanted, condition=""):
-            """Start one query without waiting for its answer."""
-            return pool.submit(zip_numbers, dataset, zip_field, zip_codes, wanted, condition)
-
-        waiting = [
-            ask(TAX_LOTS, "zipcode", {"apartments": "sum(unitsres)"}),
-            ask(VIOLATIONS, "zip", {"serious_violations": "count(*)"},
-                f"violationstatus = 'Open' AND class = '{SERIOUS_VIOLATION_CLASS}'"),
-            ask(COMPLAINTS, "post_code", {"tenant_problems": "count(*)"}, f"received_date > '{since}'"),
-            ask(BEDBUG_REPORTS, "postcode", {
-                # a building can file twice in a year, so buildings are counted, not filings
-                "buildings_filing": "count(distinct building_id)",
-                "buildings_with_bedbugs": "count(distinct case(infested_dwelling_unit_count > 0, building_id))",
-            }, f"filing_date > '{since}'"),
-            ask(RAT_INSPECTIONS, "zip_code", {
-                "rat_inspections": "count(*)",
-                "rat_inspections_with_rats": "sum(case(result like '%Rat Activity%', 1, true, 0))",
-            }, f"inspection_type = 'Initial' AND inspection_date > '{since}'"),  # first visits, not follow-ups or treatments
-        ]
-        numbers = {zip_code: {} for zip_code in zip_codes}
-        for job in waiting:
-            for zip_code, found in job.result().items():
-                numbers[zip_code].update(found)
-        return numbers
-
-
-def rate(part: int, whole: int, per: int) -> float | None:
-    """How many of `part` there are for every `per` of `whole`, to one decimal (per=100 gives a percent)."""
-    if not whole:
-        return None  # nothing to divide by: no apartments, filings or inspections on record
-    return round(part / whole * per, 1)
-
-
-def neighborhood_numbers(zip_codes: list, numbers: dict) -> dict:
-    """One neighborhood's totals over its ZIP codes, with the rates that let neighborhoods of different sizes be compared."""
-    totals = {}
-    for zip_code in zip_codes:
-        for name, number in numbers[zip_code].items():
-            totals[name] = totals.get(name, 0) + number
-    per_apartments = f"per_{RATE_PER_APARTMENTS}_apartments"
-    return {
-        "apartments": totals["apartments"],
-        "open_serious_violations": totals["serious_violations"],
-        f"open_serious_violations_{per_apartments}": rate(totals["serious_violations"], totals["apartments"], RATE_PER_APARTMENTS),
-        "tenant_problems_last_12_months": totals["tenant_problems"],
-        f"tenant_problems_{per_apartments}": rate(totals["tenant_problems"], totals["apartments"], RATE_PER_APARTMENTS),
-        "buildings_filing_bedbug_reports": totals["buildings_filing"],
-        "buildings_reporting_bedbugs": totals["buildings_with_bedbugs"],
-        "percent_of_buildings_reporting_bedbugs": rate(totals["buildings_with_bedbugs"], totals["buildings_filing"], 100),
-        "rat_inspections_last_12_months": totals["rat_inspections"],
-        "rat_inspections_that_found_rats": totals["rat_inspections_with_rats"],
-        "percent_of_rat_inspections_that_found_rats": rate(totals["rat_inspections_with_rats"], totals["rat_inspections"], 100),
-    }
-
-
-# --- The four tools the agent calls ---
-
-
-def report_or_error(make_report) -> str:
-    """Build a tool's report and return it as JSON text.
-
-    When the open data sites fail, return a short message the model can act on instead, so a failure
-    never reaches the user as a crash.
-    """
-    try:
-        return json.dumps(make_report())
-    except requests.RequestException:
-        return json.dumps(DATA_DOWN)
-    except UNEXPECTED_SHAPE:
-        return json.dumps(DATA_UNREADABLE)
-
-
-def run_check(address: str, make_report, needs_building_number: bool = True) -> str:
-    """The steps the three address tools share, around the one step that differs (`make_report`).
-
-    Find the address, then build the tool's report.
-    """
-    building = lookup_address(address)
-    if "error" in building:
-        return json.dumps(building)
-    if needs_building_number and building["bin"] in SHARED_BUILDING_IDS:
-        return json.dumps(NO_BUILDING_RECORD)
-    return report_or_error(lambda: make_report(building))
-
-
-def building_report(building: dict) -> dict:
-    """Everything check_building reports: the building's facts, violations, tenant problems, rats and bedbugs."""
-    facts = building_facts(building["bbl"])
-    violation_counts = open_violations(building["bin"])
-    report = {
-        "address": building["address"],
-        "building": facts or "no tax record found",
-        "open_violations_total": sum(violation_counts.values()),  # added up here so the model does not have to
-        "open_violations_by_class": violation_counts,
-        "violation_classes": VIOLATION_CLASSES,
-        # only ask for the details when there is something open
-        "open_violation_details": open_violation_details(building["bin"]) if violation_counts else "none",
-        "tenant_complaints_last_12_months": tenant_complaints(building["bin"]),
-        "recent_rat_inspections_on_tax_lot": recent_rat_inspections(building["bbl"]) or "none on record",
-        "latest_bedbug_report": latest_bedbug_report(building["bin"]) or "none on record",
-        "limits": RECORD_LIMITS,
-        "sources": {
-            "building": source(TAX_LOTS),
-            "open_violations": source(VIOLATIONS),
-            "tenant_complaints": source(COMPLAINTS),
-            "rat_inspections": source(RAT_INSPECTIONS),
-            "bedbug_report": source(BEDBUG_REPORTS),
-        },
-    }
-    if facts and facts["residential_units"] == 0:
-        report["note"] = (
-            f"City tax records list no residential units at this address (building type: {facts['building_type']}), "
-            "so housing records such as violations and bedbug reports may not apply. Tell the user this may not "
-            "be an apartment building."
-        )
-    return report
-
-
-def landlord_report(building: dict) -> dict:
-    """Everything check_landlord reports: the owner, and a company owner's record across its buildings."""
-    owner = building_owner(building["bin"])
-    facts = building_facts(building["bbl"])
-    owner_on_tax_record = facts["owner_on_tax_record"] if facts else None  # can be a different company
-    if owner is None:
-        return {
-            "address": building["address"],
-            "owner": "not registered with NYC's housing agency",
-            "owner_on_tax_record": owner_on_tax_record,
-            "note": ("This building has no current registration with NYC's housing agency, so the owner's other "
-                     "buildings cannot be looked up. The owner named on the city's tax record is shown instead."),
-            "sources": {"owner": source(REGISTRATIONS), "owner_on_tax_record": source(TAX_LOTS)},
-        }
-
-    registration_end = owner["registration_end_date"]
-    report = {
-        "address": building["address"],
-        "owner": owner["name"],  # from the latest housing registration
-        "registration_end_date": registration_end,
-        "owner_on_tax_record": owner_on_tax_record,
-        "sources": {
-            "owner": source(CONTACTS),
-            "registration_end_date": source(REGISTRATIONS),
-            "owner_on_tax_record": source(TAX_LOTS),
-        },
-    }
-    if registration_end and registration_end < one_year_ago():
-        report["registration_note"] = (
-            f"This registration ended on {registration_end} and has not been renewed in the city's records, so the "
-            "owner shown may be out of date; compare it with the owner on the tax record."
-        )
-    if owner["kind"] == "company":
-        report.update(owner_violations(owner["name"]))
-        report["violation_classes"] = VIOLATION_CLASSES
-        report["sources"]["buildings_registered"] = source(REGISTRATIONS)
-        report["sources"]["open_violations"] = source(VIOLATIONS)
-        report["note"] = ("Counts cover buildings registered under this exact company name. Landlords often use a "
-                          "different company name for each building, so the true total can be higher. The list can "
-                          "include registrations that have lapsed, so a few of these buildings may no longer belong "
-                          "to this owner.")
-    else:
-        report["note"] = "The owner is a person, so their other buildings are not looked up: personal names are not unique."
-    return report
-
-
-def neighborhood_report(building: dict) -> dict:
-    """Everything check_neighborhood reports: noise on the block and the subway stations nearby."""
-    stations = nearby_stations(building["latitude"], building["longitude"])
-    return {
-        "address": building["address"],
-        "noise_complaints_last_12_months": noise_complaints(building["latitude"], building["longitude"]),
-        "subway_stations_nearby": stations or "none within about a 10-minute walk",
-        "note": "Walking minutes are straight-line estimates; real walks take a little longer.",
-        "limits": "Noise complaints count calls to 311, not the noise itself: a block where nobody calls looks quiet.",
-        "sources": {
-            "noise_complaints": source(COMPLAINTS_311),
-            "subway_stations": source(SUBWAY_STATIONS, STATE_DATASET_PAGE),
-        },
-    }
-
-
-def neighborhood_comparison(neighborhoods: list) -> dict:
-    """Everything compare_neighborhoods reports: each neighborhood's numbers, what they mean, their limits and their sources."""
-    places = []  # one entry per neighborhood: its name with its ZIP codes, or with the reason it was not found
-    for name in neighborhoods:
-        if not isinstance(name, str) or not name.strip():  # the model can send a number or an empty name
-            places.append({"neighborhood": str(name), "error": "This is not a neighborhood name. Ask the user for one."})
-        else:
-            places.append({"neighborhood": name.strip(), **find_zip_codes(name)})
-
-    times_used = {}  # ZIP code -> how many of the neighborhoods it is counted in
-    for place in places:
-        for zip_code in place.get("zip_codes", []):
-            times_used[zip_code] = times_used.get(zip_code, 0) + 1
-
-    since = one_year_ago()
-    if times_used:
-        numbers = area_counts(sorted(times_used), since)
-        for place in places:
-            if "zip_codes" in place:
-                place.update(neighborhood_numbers(place["zip_codes"], numbers))
-
-    report = {
-        "counted_since": since,  # where "the last 12 months" starts
-        "neighborhoods": places,
-        "what_the_numbers_mean": {
-            "zip_codes": (
-                f"The ZIP codes where at least {round(100 * MIN_ZIP_SHARE)}% of the bedbug filings are in the "
-                "neighborhood. percent_of_neighborhood_in_these_zip_codes is the share of the neighborhood's own "
-                "bedbug filings that those ZIP codes hold: when it is low, the numbers describe only part of the "
-                "neighborhood."
-            ),
-            "apartments": "Residential units on the city's tax lots in the neighborhood's ZIP codes, houses and condos included.",
-            "open_serious_violations": (
-                f"Housing-code violations of class {SERIOUS_VIOLATION_CLASS} (immediately hazardous) that are open "
-                "today, whenever they were issued."
-            ),
-            "tenant_problems": (
-                f"Problems tenants reported to the city's housing agency since {since}, such as no heat or pests. "
-                "One complaint can list several problems."
-            ),
-            "bedbugs": (
-                "Owners of buildings with three or more apartments file a bedbug report every year. The percent is "
-                f"the share of buildings that filed since {since} and reported at least one apartment with bedbugs "
-                f"in any filing since {since}."
-            ),
-            "rat_inspections": (
-                f"First visits by the city's rat inspectors since {since}. The percent is the share that found "
-                "signs of rats."
-            ),
-        },
-        "limits": (
-            f"{RECORD_LIMITS} Rat inspectors visit some areas far more than others, so compare the percent, not "
-            "the number of inspections. ZIP codes do not follow neighborhood lines exactly; the ZIP codes counted "
-            "are listed for each neighborhood. These records say nothing about rents, crime or what is for rent."
-        ),
-        "sources": {
-            "zip_codes": source(BEDBUG_REPORTS),
-            "apartments": source(TAX_LOTS),
-            "open_serious_violations": source(VIOLATIONS),
-            "tenant_problems": source(COMPLAINTS),
-            "bedbugs": source(BEDBUG_REPORTS),
-            "rat_inspections": source(RAT_INSPECTIONS),
-        },
-    }
-    shared_zip_codes = sorted(zip_code for zip_code, times in times_used.items() if times > 1)
-    if shared_zip_codes:
-        report["shared_zip_codes_note"] = (
-            f"ZIP code(s) {', '.join(shared_zip_codes)} are counted in more than one of these neighborhoods, "
-            "because each of them holds a large part of that ZIP code."
-        )
-    return report
-
-
-def check_building(address: str) -> str:
-    """Tool: what the city's records say about one NYC apartment building."""
-    return run_check(address, building_report)
-
-
-def check_landlord(address: str) -> str:
-    """Tool: who owns one NYC apartment building, and their record across the buildings they register."""
-    return run_check(address, landlord_report)
-
-
-def check_neighborhood(address: str) -> str:
-    """Tool: noise on the block and nearby subway stations for one NYC address."""
-    return run_check(address, neighborhood_report, needs_building_number=False)  # it only uses the coordinates
-
-
-def compare_neighborhoods(neighborhoods: list) -> str:
-    """Tool: city housing records added up over one to three whole NYC neighborhoods, side by side."""
-    if isinstance(neighborhoods, str):  # the model sometimes sends "Astoria, Bushwick" instead of a list
-        neighborhoods = neighborhoods.split(",")
-    if not isinstance(neighborhoods, list) or not neighborhoods:
-        return json.dumps({"error": "No neighborhood was given. Ask the user which NYC neighborhoods to compare."})
-    if len(neighborhoods) > MAX_NEIGHBORHOODS:
-        return json.dumps({"error": f"At most {MAX_NEIGHBORHOODS} neighborhoods can be compared in one call. "
-                                    "Call again for the others."})
-    return report_or_error(lambda: neighborhood_comparison(neighborhoods))
+from buildings import check_building, check_landlord, check_neighborhood
+from neighborhoods import TOPICS, compare_neighborhoods
 
 
 # --- What the model sees, and what the harness runs ---
@@ -884,6 +28,7 @@ ADDRESS_ARGUMENT = {
         "description": "NYC street address starting with the building number, e.g. '600 W 113th St, Manhattan'",
     },
 }
+
 
 APARTMENT_TOOLS = [
     {
@@ -931,15 +76,18 @@ APARTMENT_TOOLS = [
         "function": {
             "name": "compare_neighborhoods",
             "description": (
-                "Compare one to three whole NYC neighborhoods on city housing records. For each neighborhood it "
-                "returns the ZIP codes it was counted over and, for those ZIP codes: open class C (immediately "
-                "hazardous) housing-code violations and the problems tenants reported in the last 12 months, both "
-                "as a count and per 1,000 apartments; the percent of apartment buildings that reported bedbugs in "
-                "any filing of the last 12 months; and the percent of rat inspections that found rats. It also returns what "
-                "each number means, what the records cannot show, and the dataset name and link behind each number. "
-                "Use it when the user is choosing where to live and names neighborhoods, not street addresses; for "
-                "one building use check_building. It knows nothing about rents, crime or what is for rent. The "
-                "first call for a neighborhood can take up to a minute."
+                "A scorecard for one to three whole NYC neighborhoods, each figure next to the same figure for NYC "
+                "as a whole, with the comparison already in words (for example \"42% lower than NYC overall\"). "
+                "Four topics: building_upkeep (open class C violations and tenant problems per 1,000 apartments), "
+                "pests (the percent of buildings reporting bedbugs and of rat inspections finding rats, also said as "
+                "\"about 1 in 3\"), safety (crimes and felonies reported to the NYPD per 1,000 residents, this year "
+                "through the latest quarter published) and cost_of_living (the typical rent current tenants pay a "
+                "month and household income a year, from the US Census survey for 2020-2024). With several "
+                "neighborhoods it also says how they differ on each row. Each topic comes with its meaning, one "
+                "caveat and its sources, given once in about_the_topics. Use it when the user is choosing where to "
+                "live and names neighborhoods, not street addresses; for one building use check_building. It lists "
+                "no apartments for rent and no asking rents. The first call for a neighborhood can take up to a "
+                "minute."
             ),
             "parameters": {
                 "type": "object",
@@ -949,7 +97,17 @@ APARTMENT_TOOLS = [
                         "items": {"type": "string"},
                         "description": (
                             "One to three NYC neighborhood names as people say them, e.g. ['Astoria', 'Bushwick']. "
-                            "Not street addresses and not ZIP codes."
+                            "Leave out the borough: 'Astoria', not 'Astoria, Queens'. Not street addresses and "
+                            "not ZIP codes."
+                        ),
+                    },
+                    "topics": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": list(TOPICS)},
+                        "description": (
+                            "Only the topics the task asks about, e.g. ['safety'] for a question about crime only, "
+                            "or ['cost_of_living'] for rent or income only. Leave it out for a general question "
+                            "such as where to live: then all four topics come back."
                         ),
                     },
                 },
@@ -958,6 +116,7 @@ APARTMENT_TOOLS = [
         },
     },
 ]
+
 
 APARTMENT_TOOL_MAP = {
     "check_building": check_building,
@@ -973,30 +132,43 @@ HOUSING_RESEARCHER = {
     "name": "housing",
     # what a lead agent reads to decide whether a task belongs to this researcher
     "description": (
-        "Looks up NYC housing records. For whole neighborhoods: serious open violations and tenant problems per "
-        "1,000 apartments, bedbug reports and rat inspections. For a street address: the building's violations, "
-        "tenant complaints, rats and bedbugs, its owner and the owner's other buildings, noise on the block and "
-        "nearby subway stations. Send it a task when the question is about the condition of housing in named "
-        "neighborhoods or at given addresses. It cannot find rents, listings or crime."
+        "Looks up NYC city records, NYPD crime reports and US Census figures. For whole neighborhoods: a scorecard "
+        "of building upkeep, pests, safety, typical rent and income, each next to NYC as a whole. For a street "
+        "address: the building's violations, tenant complaints, rats and bedbugs, its owner and the owner's other "
+        "buildings, noise on the block and nearby subway stations. Send it a task when the question is about "
+        "building upkeep, pests, safety, typical rent or income in named neighborhoods, or about given addresses. "
+        "It cannot find listings or the asking rent of an apartment on the market."
     ),
     # what the researcher itself is told
     "instructions": (
-        "You research one task about housing in New York City, using only your tools, and report what the city's "
-        "records say.\n"
-        "- Whole neighborhoods: call compare_neighborhoods once, with every neighborhood named in the task.\n"
+        "You research one task about housing in New York City, using only your tools, and report what the "
+        "records say in plain words.\n"
+        "- Whole neighborhoods: call compare_neighborhoods once, with every neighborhood named in the task. Pass "
+        "topics only when the task asks about some of them, e.g. [\"safety\"] for crime only; for a general "
+        "question such as where to live, leave topics out.\n"
+        "- Reply with one bullet per topic, starting with its name in plain words: \"Building upkeep:\", "
+        "\"Pests:\", \"Safety:\", \"Typical rent:\", \"Income:\". In each, give every neighborhood's figure in "
+        "everyday words (use in_everyday_words where there is one), how it compares with NYC overall and, with "
+        "several neighborhoods, how they differ, using the comparison words the tool returned word for word. Add "
+        "the topic's caveat in a few words and end with its source as a markdown link.\n"
+        "- Rent: say it is what current tenants pay, pooled across all apartment sizes (not the rent for any one "
+        "size), usually below today's asking rent, from Census data, not our estimate. Where a figure is marked "
+        "here_is_at_least, say \"at least\".\n"
+        "- Safety: give the period the crime figures cover.\n"
         "- A street address: call check_building for the building's condition, heat or pests, check_neighborhood "
         "for noise or transit, and check_landlord for the owner. When the task compares addresses, call "
         "check_building and check_neighborhood for each of them.\n"
         "- Each tool returns the address or the ZIP codes it matched. Abbreviations are not a difference (W and "
         "WEST, St and STREET). If the matched street number or street name is a different street from the one in "
         "the task, do not describe that building: report what was matched and that the address needs confirming.\n"
-        "- Reply with the facts that answer the task and nothing else, at most 10 bullets. End every bullet with "
-        "the source of that fact as a markdown link, taken from \"sources\" in the tool result, for example "
+        "- At most 10 bullets. End every bullet with its source as a markdown link from the tool result, for example "
         "([Housing Maintenance Code Violations](https://data.cityofnewyork.us/d/wvxf-dwi5)).\n"
         "- Use only what the tools returned. Add nothing you know yourself about a street, a neighborhood or a "
-        "building, and do not guess rents, listings or safety.\n"
-        "- In a last bullet, say what the records cannot show, from \"limits\" or \"note\" in the tool result, and name any "
-        "part of the task the tools could not answer."
+        "building, and do not guess listings or asking rents.\n"
+        "- Name any part of the task the tools could not answer, and any note in the result (a ZIP code shared "
+        "with a neighbor, ZIP codes left out, data that did not load).\n"
+        "- After a neighborhood comparison, end with one bullet: \"Next: found an apartment? Send its address and I "
+        "can check that building, its landlord and its block before you sign.\""
     ),
     "tools": APARTMENT_TOOLS,
     "tool_map": APARTMENT_TOOL_MAP,
