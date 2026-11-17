@@ -1,6 +1,6 @@
 # New in NYC: a research agent for settling into New York
 
-Ask one question about settling into New York City and a small team of agents researches it in parallel and writes you a cited report. It compares neighborhoods and buildings using the city's housing records, finds free events and giveaways nearby, and checks what furnishing a room costs.
+Ask one question about settling into New York City and a small team of agents researches it in parallel and writes you a cited report. It compares neighborhoods on housing records, crime, rent and income, checks single buildings, finds free events and giveaways nearby, and checks what furnishing a room costs.
 
 **Live app:** https://ieor4570-project2-git-770026520963.us-east1.run.app (sign in with a Columbia Google account if prompted)
 
@@ -35,11 +35,13 @@ You (one chat box)
 
 ## Data
 
-All of it is read live by tools, not stored in the repo, so nothing needs to be loaded to run the app. The model does not know it: the events change daily and the housing records are updated by the city continuously.
+Most of it is read live by tools. The only files we ship are the Census figures and the whole-city comparison numbers in `data/` (see `data/README.md` for how they are built), so the live site does not depend on a Census key. The model does not know any of it: the events change daily, the housing and crime records are updated by the city continuously, and the Census tables are specific figures per ZIP code.
 
 | Source | Used for | How it is read |
 |---|---|---|
 | NYC Open Data: Housing Maintenance Code Violations (`wvxf-dwi5`), Complaints and Problems (`ygpa-z7cr`), Rodent Inspection (`p937-wjvj`), Bedbug Reporting (`wz6d-d3jb`), Multiple Dwelling Registrations (`tesw-yqqr`), Registration Contacts (`feu5-w2e2`), PLUTO tax lots (`64uk-42ks`), 311 Service Requests (`erm2-nwe9`) | Building and neighborhood condition, owner, noise | Socrata API, `https://data.cityofnewyork.us/resource/<id>.json`, no key |
+| NYC Open Data: NYPD Complaint Data Current Year To Date (`5uac-w243`) | Crimes and felonies per 1,000 residents | Socrata API, no key |
+| US Census Bureau, American Community Survey 5-year 2020-2024 (tables B01003, B11001, B25003, B19013, B25064) | Typical rent, household income, residents per ZIP code | Built once into `data/census_zip_codes.csv` by `data/build_census_zip_codes.py` |
 | NYS Open Data: MTA Subway Stations (`39hk-dx4f`) | Nearby subway | `https://data.ny.gov/resource/39hk-dx4f.json` |
 | NYC Parks Events feed | Free Parks events | `https://www.nycgovparks.org/xml/events_300_rss.json` |
 | [NYC for FREE](https://www.nycforfree.co/events) | Pop-ups, giveaways, free food | Their public events page, read lightly and cached for 30 minutes, credited and linked back |
@@ -50,7 +52,7 @@ Wait times, itineraries and the curbside-find score are our own estimates, not d
 
 ## Tools by researcher
 
-- **Housing** (`apartment.py`): `check_building` (open violations, tenant problems, rats, bedbugs), `check_landlord` (owner and their other buildings), `check_neighborhood` (noise and subway), `compare_neighborhoods` (per-1,000-apartment counts, bedbug share and rat share over a neighborhood's ZIP codes). Every result names its datasets with links and says what the records cannot show.
+- **Housing** (`apartment.py`): `check_building` (open violations, tenant problems, rats, bedbugs), `check_landlord` (owner and their other buildings), `check_neighborhood` (noise and subway), `compare_neighborhoods` (a scorecard for one to three neighborhoods: building upkeep, pests, safety and cost of living, each figure next to NYC as a whole with the comparison in words, and how the neighborhoods differ). Every result names its datasets with links and says what the records cannot show.
 - **Events** (`events.py`): `events_near_neighborhoods` (counts free Parks events and NYC for FREE listings within about 1.5 km of up to three neighborhoods), `find_free_events`, `find_freebies`, `get_forecast`, `build_itinerary`, `estimate_wait_time`, `curb_hunt_score`, `freebie_checklist`.
 - **Shopping** (`shopping.py`): `search_products_that_fit` (Amazon search under a budget, then checks each product's listed size against the space).
 
@@ -58,7 +60,7 @@ Tools return errors as plain messages with a hint instead of raising, so the mod
 
 ## Sample queries
 
-The data was read on 2026-11-10, and "this weekend" is Nov 14-15, 2026. City records change, so exact numbers may differ when you run these. For each query the "no tools" answer is the same model (`gemini-3.5-flash-lite`) with no system prompt and no tools.
+The data was read on 2026-11-17, and "this weekend" is Nov 21-22, 2026. City records change, so exact numbers may differ when you run these. For each query the "no tools" answer is the same model (`gemini-3.5-flash-lite`) with no system prompt and no tools.
 
 ### 1. Comparing two neighborhoods
 
@@ -68,16 +70,18 @@ The data was read on 2026-11-10, and "this weekend" is Nov 14-15, 2026. City rec
 
 | | Astoria | Morningside Heights | Source |
 |---|---|---|---|
-| Open class C violations per 1,000 apartments | 92.1 | 265.8 | Housing Maintenance Code Violations (`wvxf-dwi5`), counted over the neighborhood's ZIP codes |
-| Tenant problems per 1,000 apartments (12 months) | 178.4 | 457.1 | Complaints and Problems (`ygpa-z7cr`) |
-| Buildings with bedbug filings | 1.6% | 4.9% | Bedbug Reporting (`wz6d-d3jb`) |
-| Rat inspections finding rats | 31.9% of 897 | 12.9% of 4,423 | Rodent Inspection (`p937-wjvj`) |
-| Free NYC Parks events within 1.5 km, Nov 14-15 | 1 | 5 | NYC Parks Events feed |
-| NYC for FREE listings within 1.5 km | 0 | 0 | nycforfree.co/events |
+| Open class C violations per 1,000 apartments | 92.4 (NYC 158.7) | 266.7 | Housing Maintenance Code Violations (`wvxf-dwi5`), counted over the neighborhood's ZIP codes |
+| Tenant problems per 1,000 apartments (12 months) | 181.2 (NYC 266.2) | 462.4 | Complaints and Problems (`ygpa-z7cr`) |
+| Buildings with bedbug filings | 1.6% | 5.0% | Bedbug Reporting (`wz6d-d3jb`) |
+| Rat inspections finding rats | 31.7% | 12.7% | Rodent Inspection (`p937-wjvj`) |
+| Crimes per 1,000 residents, Jan 1 to Sep 30, 2026 | 35.7 (NYC 50.3) | 74.2 | NYPD Complaint Data (`5uac-w243`) and Census population |
+| Typical rent a month, all apartment sizes | $2,153 (NYC $1,821) | $1,531 | Census ACS 2020-2024, table B25064 |
+| Household income a year | $91,473 | $59,587 | Census ACS 2020-2024, table B19013 |
+| Free listings within 1.5 km, Nov 21-22 | 1 (Yummy Dips Chicken Giveaway, Nov 21, 1.0 km) | 0 | NYC Parks Events feed and nycforfree.co/events |
 
-It should also say that Morningside Heights is described by ZIP 10027, which mostly covers its neighbors, and that fewer listings can mean fewer published events, not fewer events.
+It should also say that Morningside Heights is described by ZIP 10027, which mostly covers its neighbors, and that rent is pooled across all apartment sizes and is usually below today's asking rent.
 
-**Agent answer** (35 s; the Lead sends the housing and events researchers out at the same time, and the Writer builds a cited table of the figures above, the closest events with links, and a "What the data can't tell us" section).
+**Agent answer** (30 s; the Lead sends the housing and events researchers out at the same time, and the Writer builds a cited table of the figures above, the closest event with its link, the ZIP code note, and a "What the data can't tell us" section).
 
 **Same model, no tools:** a long general write-up of each neighborhood's vibe, housing stock, commute and typical prices. It has no numbers from city records, no events for this weekend and no sources, and it does not say that it has no access to current data.
 
@@ -101,21 +105,28 @@ It should also say that Morningside Heights is described by ZIP 10027, which mos
 
 > What free events and giveaways are near Morningside Heights this weekend?
 
-**Expected answer and where it comes from:** 5 free NYC Parks events within 1.5 km on Nov 14-15, including Winterization Workday (Nov 15, 0.3 km), Outdoor Skills: Survival 101 (Nov 14, 0.6 km) and It's My Park at Bloomingdale Playground (Nov 15, 1.2 km), and no NYC for FREE giveaways listed nearby (NYC Parks Events feed and nycforfree.co/events).
+**Expected answer and where it comes from:** no free Parks events or NYC for FREE giveaways within 1.5 km of Morningside Heights on Nov 21-22. A few miles north there are Parks events such as Washington Heights Street Tree Care (Nov 21, Roger Morris Park) (NYC Parks Events feed and nycforfree.co/events). The listings change every week, so a run on another day can show more or fewer events; the point is that it reports what is there and says when nothing is nearby.
 
-**Agent answer** (about 10 s, only the events researcher is sent out): the counts and the three closest events, each with its link, and what the counts cannot show.
+**Agent answer** (8 s, only the events researcher is sent out): says nothing was found within 1.5 km, lists the two upper Manhattan events it did find with links, and says what the counts cannot show.
 
 **Same model, no tools:** says it cannot see live events and suggests checking the Columbia events calendar, local libraries and neighborhood sites. It names no actual event.
 
-### Bonus: a question the data cannot answer
+### Bonus: a question the data only half answers
 
 > What is the typical monthly rent for a studio in Astoria?
 
-**Expected answer:** none of our sources contains rents or listings, so the agent should say it cannot answer and offer what it can do.
+**Expected answer:** none of our sources has studio rents or asking rents. The Census figure is pooled across all apartment sizes ($2,153 a month, table B25064), so the agent should say it cannot give a studio rent, give the pooled figure with its source, and say it is usually below today's asking rent.
 
-**Agent answer:** the Lead sends no researcher out. It says its researchers cannot find rents and offers housing conditions, free events or furnishing cost instead.
+**Agent answer** (24 s): says the tools do not give studio-specific rents, then gives the $2,153 pooled figure (18% above NYC's $1,821) with the Census link, the household income, and the upkeep, pest and crime figures, and a "What the data can't tell us" section that says the rent is not specific to studios.
 
 **Same model, no tools:** answers confidently with a range of $1,900 to $2,500 "as of mid-2024" from memory, with no source.
+
+## Who built what
+
+- **Housing researcher** (Twyla, xz2843): `apartment.py`, `neighborhoods.py`, `buildings.py`, `open_data.py` and `data/`: the building, landlord and neighborhood tools, the scorecard with crime, rent and income next to NYC, and the Cloud Run deployment.
+- **Events researcher** (usm2104): `events.py`: free Parks events and giveaways, forecasts and day plans, and neighborhood event counts.
+- **Shopping researcher** (Alisa, sz3410): `shopping.py`: Amazon search under a budget with a size-fit check.
+- **Lead, researcher loop, Writer, server and front end** (usm2104): `agents.py`, `app.py`, `index.html`, and this README.
 
 ## Run it locally
 
