@@ -282,7 +282,7 @@ def _search(query, max_price, max_width_in, max_depth_in, max_height_in, max_res
         if not by_verdict["yes"]:
             summary += " None is a confirmed fit; say so, and suggest relaxing a measurement or the budget."
 
-        return {
+    return {
         "query": query,
         "max_price": max_price,
         "limits_in": {a: v for a, v in limits.items() if v is not None},
