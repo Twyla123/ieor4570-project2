@@ -55,7 +55,7 @@ Most of it is read live by tools. Two small files do ship with the app, in `data
 | NYC Parks Events feed | Free Parks events | `https://www.nycgovparks.org/xml/events_300_rss.json` |
 | [NYC for FREE](https://www.nycforfree.co/events) | Pop-ups, giveaways, free food | Their public events page, read lightly and cached for 30 minutes, credited and linked back |
 | Open-Meteo | Forecasts for day plans | Public API, no key |
-| Amazon search through SerpApi | Furniture prices and listed sizes | Needs `SERPAPI_API_KEY` |
+| Amazon search results and product pages, through SerpApi (`amazon` and `amazon_product` engines) | Prices, ratings, product links and listed sizes of furniture and other home items | `https://serpapi.com/search`, needs `SERPAPI_API_KEY`. Each tool call uses 1 search credit, plus up to 4 product-page credits when sizes have to be looked up |
 
 Wait times, itineraries and the curbside-find score are our own estimates, not data, and the agent labels them that way. We did not use What is this line for? because its terms ban automated access.
 
@@ -70,13 +70,18 @@ Wait times, itineraries and the curbside-find score are our own estimates, not d
   - **The code does the arithmetic, not the model.** Every percent, ratio and "about 1 in 3" is computed in Python, and the researcher is told to repeat those words exactly, so the comparisons the housing researcher reports are calculated, not estimated by the model.
   - Every result lists the source of each figure with a link and says what its records cannot show, such as problems nobody reported, noise nobody called 311 about, or buildings an owner registered under another company name.
 - **Events** (`events.py`): `events_near_neighborhoods` (counts free Parks events and NYC for FREE listings within about 1.5 km of up to three neighborhoods), `find_free_events`, `find_freebies`, `get_forecast`, `build_itinerary`, `estimate_wait_time`, `curb_hunt_score`, `freebie_checklist`.
-- **Shopping** (`shopping.py`): `search_products_that_fit` (Amazon search under a budget, then checks each product's listed size against the space).
+- **Shopping** (`shopping.py`). One tool, `search_products_that_fit(query, max_price, max_width_in, max_depth_in, max_height_in, max_results)`. `query` (short keywords such as "narrow bookshelf") and `max_price` (dollars per item) are required. The three size limits are in inches and optional, and `max_results` is 1 to 10, default 5.
+  - It searches Amazon, keeps the results at or under the budget, and checks up to 12 of them against the space. Each product comes back with its price, rating, link, listed size in inches and a fit verdict: `yes`; `maybe` (it fits on the sides the listing gives but one is missing, or the listing does not say which side is which and it fits only some ways round); `unknown` (no size listed); or `no`, which is left out of the results.
+  - **How a size is found.** The tool reads it from the listing title, such as `47.2"W x 23.6"D x 28.7"H` or `120 x 60 cm` (centimeters become inches). When the title has no size, it opens the product page and reads its spec table, at most 4 times per call, and remembers each product's size so a repeat costs no credit. A bare "2 x 4" with no unit or side label is treated as a pack count, not a size. When a listing gives two numbers without labels, the longer one is taken as the width.
+  - **The code checks the fit, not the model.** Each side is compared with its limit in Python, and the verdict comes back with a note that explains it, such as "width is 55 in, limit is 48 in".
+  - Without measurements the tool filters by price only and says so. Given a total budget for several items, the researcher splits it across them, says how, and adds up the cheapest fitting option of each. Given no budget, it asks for one instead of guessing.
+  - Every result links to each product and to the Amazon search, and says what it cannot show: prices are a snapshot before tax and shipping, sizes come from listing text and can be missing or wrong, and delivery and assembly are not checked. It searches new items on Amazon only, so when someone wants used or free furniture the Lead also sends the events researcher out for giveaways and curbside finds.
 
 Tools return errors as plain messages with a hint instead of raising, so the model can recover.
 
 ## Sample queries
 
-The data was read on 2026-11-17, except the housing figures in query 1 and the bonus, which were read on 2026-11-18; the NYC figures next to them were counted on 2026-11-12. "This weekend" is Nov 21-22, 2026. City records change, so exact numbers may differ when you run these. For each query the "no tools" answer is the same model (`gemini-3.5-flash-lite`) with no system prompt and no tools.
+The data was read on 2026-11-17, except the housing figures in query 1 and the bonus and the Amazon results in query 4, which were read on 2026-11-18; the NYC figures next to them were counted on 2026-11-12. "This weekend" is Nov 21-22, 2026. City records change, so exact numbers may differ when you run these. For each query the "no tools" answer is the same model (`gemini-3.5-flash-lite`) with no system prompt and no tools.
 
 ### 1. Comparing two neighborhoods
 
@@ -136,6 +141,24 @@ Free things to do:
 **Agent answer** (8 s, only the events researcher is sent out): says nothing was found within 1.5 km, lists the two upper Manhattan events it did find with links, and says what the counts cannot show.
 
 **Same model, no tools:** says it cannot see live events and suggests checking the Columbia events calendar, local libraries and neighborhood sites. It names no actual event.
+
+### 4. A desk that fits
+
+> I'm furnishing a small room. I need a desk under $120 that fits a 40-inch-wide, 24-inch-deep spot. What are my options?
+
+**Expected answer and where it comes from:** desks at or under $120 whose listed size is at most 40 inches wide and 24 inches deep, each with its price, rating, fit verdict and Amazon link, and the cheapest one named (Amazon search results through SerpApi). On 2026-11-18 the fitting options included:
+
+| Desk | Price | Rating | Fits 40" wide x 24" deep |
+|---|---|---|---|
+| Pamray 32 Inch Computer Desk with 4 Drawers | $55.99 | 4.0 | yes |
+| FURINNO Riau Folding Metal Frame Computer Desk | $60.99 | 4.0 | yes |
+| 33" Small Computer Desk with 5 Fabric Drawers (14.2" deep) | $63.99 | 4.3 | yes |
+
+Amazon's listings and prices change daily, so a later run will show different desks. It should also say what the search cannot show: prices before tax and shipping, sizes read from listing text, and no check of delivery or assembly.
+
+**Agent answer** (46 s; only the shopping researcher is sent out): the three desks above, each linked to its Amazon page, the cheapest at $55.99, and a "What the data can't tell us" section.
+
+**Same model, no tools:** calls its picks "the best options currently available", then names four desks from memory (IKEA, VASAGLE, SHW, Tribesigns) with sizes it does not source and price ranges such as "~$70 - $90", with no product links and no way to check today's price or whether a listing's size really fits 40 by 24 inches.
 
 ### Bonus: a question the data only half answers
 
